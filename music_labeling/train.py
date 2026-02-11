@@ -1,5 +1,5 @@
 """
-音楽ジャンル分類 - EfficientNet B7 (PyTorch)
+音楽ジャンル分類 - EfficientNet B3 (PyTorch)
 音源分離（Demucs）で原音・伴奏・ボーカルに分離し、
 3チャンネルメルスペクトログラムで Fine-tuning
 """
@@ -522,17 +522,17 @@ test_loader = DataLoader(
 )
 
 # ==============================================================================
-# モデル定義: EfficientNet B7
+# モデル定義: EfficientNet B3
 # ==============================================================================
 def build_model(num_classes=NUM_CLASSES):
-    """事前学習済み EfficientNet B7 を Fine-tuning 用に構築
+    """事前学習済み EfficientNet B3 を Fine-tuning 用に構築
 
     3チャンネル入力:
         ch0 = 原音メルスペクトログラム
         ch1 = 伴奏メルスペクトログラム
         ch2 = ボーカルメルスペクトログラム
     """
-    model = models.efficientnet_b7(weights=models.EfficientNet_B7_Weights.IMAGENET1K_V1)
+    model = models.efficientnet_b3(weights=models.EfficientNet_B3_Weights.IMAGENET1K_V1)
 
     # 前半の層をフリーズ（過学習防止）
     for param in model.features[:6].parameters():
