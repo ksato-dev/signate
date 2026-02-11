@@ -64,6 +64,12 @@ AUGMENT_TIME_MASKING = True       # Time Maskingを適用するか
 AUGMENT_FREQUENCY_MASKING = True  # Frequency Maskingを適用するか
 
 # ==============================================================================
+# 音源分離設定（Demucs）
+# ==============================================================================
+SEPARATION_MODEL = 'htdemucs'         # Demucsモデル名（htdemucs, htdemucs_ft, mdx_extra等）
+SEPARATION_CACHE_DIR = 'data/separated'  # 分離結果のキャッシュディレクトリ
+
+# ==============================================================================
 # ファイルパス設定
 # ==============================================================================
 CHECKPOINT_FILE = 'checkpoint.pth'

@@ -1,6 +1,7 @@
 """
 音楽ジャンル分類 - EfficientNet B7 (PyTorch)
-メルスペクトログラムを画像として扱い、事前学習済みEfficientNet B7でFine-tuning
+音源分離（Demucs）で原音・伴奏・ボーカルに分離し、
+3チャンネルメルスペクトログラムで Fine-tuning
 """
 
 import os
@@ -11,6 +12,7 @@ import numpy as np
 import pandas as pd
 import librosa
 from natsort import natsorted
+from tqdm import tqdm
 
 import torch
 import torch.nn as nn
@@ -45,6 +47,8 @@ CHECKPOINT_FILE = config.CHECKPOINT_FILE
 BEST_MODEL_FILE = config.BEST_MODEL_FILE
 SUBMIT_FILE = config.SUBMIT_FILE
 PATIENCE = config.PATIENCE
+SEPARATION_CACHE_DIR = config.SEPARATION_CACHE_DIR
+SEPARATION_MODEL = config.SEPARATION_MODEL
 
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -56,204 +60,410 @@ if torch.cuda.is_available():
 print(f"Device: {DEVICE}")
 
 # ==============================================================================
-# データ読み込み・メルスペクトログラム抽出
+# 音源分離（Demucs）
+# ==============================================================================
+def separate_audio_cached(file_path, demucs_model, cache_dir=SEPARATION_CACHE_DIR, sr=SR,
+                          device=DEVICE):
+    """音声ファイルをDemucsで分離し、原音・伴奏・ボーカルの波形を返す（キャッシュ付き）
+
+    Args:
+        file_path: 音声ファイルパス
+        demucs_model: demucs.pretrained.get_model() で取得したモデル
+        cache_dir: キャッシュディレクトリ
+        sr: 出力サンプリングレート
+        device: 推論デバイス
+
+    Returns:
+        original: 原音波形 (numpy array)
+        accompaniment: 伴奏波形 (numpy array)
+        vocals: ボーカル波形 (numpy array)
+    """
+    from demucs.apply import apply_model
+
+    basename = os.path.splitext(os.path.basename(file_path))[0]
+    cache_path = os.path.join(cache_dir, f"{basename}.npz")
+
+    # キャッシュが存在すればロード
+    if os.path.exists(cache_path):
+        data = np.load(cache_path)
+        return data['original'], data['accompaniment'], data['vocals']
+
+    os.makedirs(cache_dir, exist_ok=True)
+
+    # 原音を目標サンプリングレートで読み込み
+    original, _ = librosa.load(file_path, sr=sr, mono=True)
+
+    # Demucsのネイティブサンプリングレートで読み込み
+    demucs_sr = demucs_model.samplerate
+    y_demucs, _ = librosa.load(file_path, sr=demucs_sr, mono=True)
+
+    # Demucsはステレオ入力を想定 → モノラルを疑似ステレオに
+    # apply_model は (batch, channels, time) を期待
+    waveform = torch.FloatTensor(y_demucs).unsqueeze(0).repeat(2, 1)  # (2, time)
+    mix = waveform.unsqueeze(0)  # (1, 2, time)
+
+    with torch.no_grad():
+        # sources: (1, n_sources, 2, time)  sources順 = model.sources
+        sources = apply_model(demucs_model, mix, device=device)
+
+    sources = sources.squeeze(0)  # (n_sources, 2, time)
+    source_names = demucs_model.sources  # ['drums', 'bass', 'other', 'vocals']
+
+    # ボーカルを抽出（ステレオ→モノラル）
+    vocals_idx = source_names.index("vocals")
+    vocals_raw = sources[vocals_idx].mean(dim=0).cpu().numpy()  # (time,)
+
+    # 伴奏 = ボーカル以外のステムの合計
+    acc_indices = [i for i, name in enumerate(source_names) if name != "vocals"]
+    accompaniment_raw = sources[acc_indices].sum(dim=0).mean(dim=0).cpu().numpy()  # (time,)
+
+    # Demucsのサンプリングレートから目標サンプリングレートにリサンプル
+    if demucs_sr != sr:
+        vocals = librosa.resample(vocals_raw, orig_sr=demucs_sr, target_sr=sr)
+        accompaniment = librosa.resample(accompaniment_raw, orig_sr=demucs_sr, target_sr=sr)
+    else:
+        vocals = vocals_raw
+        accompaniment = accompaniment_raw
+
+    # 長さを揃える
+    min_len = min(len(original), len(vocals), len(accompaniment))
+    original = original[:min_len]
+    vocals = vocals[:min_len]
+    accompaniment = accompaniment[:min_len]
+
+    # キャッシュ保存
+    np.savez_compressed(cache_path,
+                        original=original,
+                        accompaniment=accompaniment,
+                        vocals=vocals)
+
+    return original, accompaniment, vocals
+
+
+def batch_separate(file_list, demucs_model, cache_dir=SEPARATION_CACHE_DIR, sr=SR,
+                   device=DEVICE):
+    """ファイルリスト全体を分離（プログレスバー付き）"""
+    cached = sum(
+        1 for f in file_list
+        if os.path.exists(
+            os.path.join(cache_dir,
+                         f"{os.path.splitext(os.path.basename(f))[0]}.npz"))
+    )
+
+    if cached == len(file_list):
+        print(f"  全{len(file_list)}ファイルがキャッシュ済み")
+        return
+
+    print(f"  キャッシュ済み: {cached}/{len(file_list)}, "
+          f"残り{len(file_list) - cached}ファイルを分離中...")
+
+    for f in tqdm(file_list, desc="  音源分離"):
+        separate_audio_cached(f, demucs_model, cache_dir, sr, device)
+
+
+# ==============================================================================
+# メルスペクトログラム抽出
 # ==============================================================================
 def extract_melspectrogram(y, sr=SR, n_mels=None):
     """音声波形からメルスペクトログラム(dB)を抽出
-    
+
     Args:
         y: 音声波形データ
         sr: サンプリングレート
         n_mels: メルバンド数。Noneの場合はlibrosaのデフォルト値(128)を使用
     """
-    # n_melsがNoneの場合はデフォルト値を使用（128）
     kwargs = {} if n_mels is None else {'n_mels': n_mels}
     mel = librosa.feature.melspectrogram(y=y, sr=sr, **kwargs)
     mel_db = librosa.amplitude_to_db(mel, ref=np.max)
     return mel_db
 
 
-def augment_audio(y, sr=SR, 
-                  pitch_shift=None, time_stretch=None, add_noise=None, time_shift=None):
-    """音声波形にオーギュメンテーションを適用
-    
-    Args:
-        y: 音声波形データ
-        sr: サンプリングレート
-        pitch_shift: ピッチシフトを適用するか（Noneの場合はconfigから取得）
-        time_stretch: タイムストレッチを適用するか（Noneの場合はconfigから取得）
-        add_noise: ノイズを追加するか（Noneの場合はconfigから取得）
-        time_shift: タイムシフトを適用するか（Noneの場合はconfigから取得）
+# ==============================================================================
+# オーギュメンテーション（3チャンネル共通パラメータ方式）
+# ==============================================================================
+def generate_augment_params(sr=SR):
+    """オーギュメンテーションパラメータを事前に生成
+
+    3チャンネル（原音・伴奏・ボーカル）に同じオーギュメンテーションを
+    適用するため、パラメータを事前に生成する。
     """
-    # デフォルト値をconfigから取得
-    if pitch_shift is None:
-        pitch_shift = config.AUGMENT_PITCH_SHIFT
-    if time_stretch is None:
-        time_stretch = config.AUGMENT_TIME_STRETCH
-    if add_noise is None:
-        add_noise = config.AUGMENT_ADD_NOISE
-    if time_shift is None:
-        time_shift = config.AUGMENT_TIME_SHIFT
-    
-    # ピッチシフト
-    if pitch_shift and np.random.random() < 0.5:
-        n_steps = np.random.uniform(config.PITCH_SHIFT_MIN, config.PITCH_SHIFT_MAX)
-        y = librosa.effects.pitch_shift(y=y, sr=sr, n_steps=n_steps)
-    
-    # タイムストレッチ
-    if time_stretch and np.random.random() < 0.5:
-        rate = np.random.uniform(config.TIME_STRETCH_MIN, config.TIME_STRETCH_MAX)
-        y = librosa.effects.time_stretch(y=y, rate=rate)
-    
-    # ノイズ追加
-    if add_noise and np.random.random() < 0.5:
-        noise_factor = np.random.uniform(config.NOISE_FACTOR_MIN, config.NOISE_FACTOR_MAX)
-        noise = np.random.randn(len(y)) * noise_factor
-        y = y + noise
-    
-    # タイムシフト
-    if time_shift and np.random.random() < 0.5:
+    params = {}
+
+    if config.AUGMENT_PITCH_SHIFT and np.random.random() < 0.5:
+        params['pitch_n_steps'] = np.random.uniform(
+            config.PITCH_SHIFT_MIN, config.PITCH_SHIFT_MAX)
+
+    if config.AUGMENT_TIME_STRETCH and np.random.random() < 0.5:
+        params['stretch_rate'] = np.random.uniform(
+            config.TIME_STRETCH_MIN, config.TIME_STRETCH_MAX)
+
+    if config.AUGMENT_ADD_NOISE and np.random.random() < 0.5:
+        params['noise_factor'] = np.random.uniform(
+            config.NOISE_FACTOR_MIN, config.NOISE_FACTOR_MAX)
+
+    if config.AUGMENT_TIME_SHIFT and np.random.random() < 0.5:
         shift_max = int(sr * config.TIME_SHIFT_MAX_SEC)
-        shift = np.random.randint(-shift_max, shift_max + 1)
+        params['time_shift'] = np.random.randint(-shift_max, shift_max + 1)
+
+    return params
+
+
+def apply_augment(y, params, sr=SR, noise_seed=None):
+    """生成済みパラメータでオーギュメンテーションを適用
+
+    Args:
+        y: 音声波形
+        params: generate_augment_params() で生成したパラメータ
+        sr: サンプリングレート
+        noise_seed: ノイズ用シード（3チャンネルに同じノイズを適用する場合に使用）
+    """
+    if 'pitch_n_steps' in params:
+        y = librosa.effects.pitch_shift(y=y, sr=sr, n_steps=params['pitch_n_steps'])
+
+    if 'stretch_rate' in params:
+        y = librosa.effects.time_stretch(y=y, rate=params['stretch_rate'])
+
+    if 'noise_factor' in params:
+        if noise_seed is not None:
+            rng = np.random.RandomState(noise_seed)
+            noise = rng.randn(len(y)) * params['noise_factor']
+        else:
+            noise = np.random.randn(len(y)) * params['noise_factor']
+        y = y + noise
+
+    if 'time_shift' in params:
+        shift = params['time_shift']
         if shift > 0:
-            # 右にシフト（前をゼロパディング）
             y = np.pad(y, (shift, 0), mode='constant')[:-shift]
         elif shift < 0:
-            # 左にシフト（後をゼロパディング）
             y = np.pad(y, (0, -shift), mode='constant')[-shift:]
-    
+
     return y
 
 
-def load_and_pad(file_list, sr=SR, n_mels=N_MELS):
-    """音声ファイル群からメルスペクトログラムを抽出し、パディングして統一サイズにする"""
-    spectrograms = []
-    for f in file_list:
-        y, _ = librosa.load(f, sr=sr)
-        mel_db = extract_melspectrogram(y, sr=sr, n_mels=n_mels)
-        spectrograms.append(mel_db)
+# ==============================================================================
+# 3チャンネル メルスペクトログラム読み込み
+# ==============================================================================
+def load_and_pad_3ch(file_list, cache_dir=SEPARATION_CACHE_DIR, sr=SR, n_mels=N_MELS):
+    """分離済み音声から3チャンネルメルスペクトログラムを抽出し、パディングして統一サイズにする
+
+    チャンネル構成:
+        ch0: 原音（Original）
+        ch1: 伴奏（Accompaniment）
+        ch2: ボーカル（Vocals）
+
+    Returns:
+        spectrograms: (N, 3, n_mels, max_frames) の numpy 配列
+        max_frames: 最大フレーム数
+    """
+    all_mels = []
+
+    for f in tqdm(file_list, desc="  メルスペクトログラム抽出"):
+        basename = os.path.splitext(os.path.basename(f))[0]
+        cache_path = os.path.join(cache_dir, f"{basename}.npz")
+        data = np.load(cache_path)
+
+        original = data['original']
+        accompaniment = data['accompaniment']
+        vocals = data['vocals']
+
+        mel_orig = extract_melspectrogram(original, sr=sr, n_mels=n_mels)
+        mel_acc = extract_melspectrogram(accompaniment, sr=sr, n_mels=n_mels)
+        mel_voc = extract_melspectrogram(vocals, sr=sr, n_mels=n_mels)
+
+        # フレーム数を揃える（リサンプル由来のわずかなずれを補正）
+        min_frames = min(mel_orig.shape[1], mel_acc.shape[1], mel_voc.shape[1])
+        mel_orig = mel_orig[:, :min_frames]
+        mel_acc = mel_acc[:, :min_frames]
+        mel_voc = mel_voc[:, :min_frames]
+
+        # (3, n_mels, time_frames)
+        mel_3ch = np.stack([mel_orig, mel_acc, mel_voc], axis=0)
+        all_mels.append(mel_3ch)
 
     # 最大フレーム数に合わせてパディング
-    max_frames = max(s.shape[1] for s in spectrograms)
+    max_frames = max(m.shape[2] for m in all_mels)
     padded = []
-    for s in spectrograms:
-        pad_width = max_frames - s.shape[1]
-        p = np.pad(s, ((0, 0), (0, pad_width)), mode='constant', constant_values=s.min())
+    for m in all_mels:
+        pad_width = max_frames - m.shape[2]
+        if pad_width > 0:
+            p = np.pad(m, ((0, 0), (0, 0), (0, pad_width)),
+                       mode='constant', constant_values=m.min())
+        else:
+            p = m
         padded.append(p)
 
     return np.array(padded), max_frames
 
 
-print("=== 学習データの読み込み ===")
+# ==============================================================================
+# 音源分離の実行
+# ==============================================================================
+print("=== データファイルの読み込み ===")
 train_master = pd.read_csv('data/train_master.csv', index_col=0)
 label_master = pd.read_csv('data/label_master.csv')
 
-# メル周波数バンドの実際の周波数分布を確認
-mel_freqs = librosa.mel_frequencies(n_mels=N_MELS, fmin=0.0, fmax=SR/2.0)
-print(f"\nメル周波数バンドの周波数分布:")
-print(f"  総バンド数: {N_MELS}")
-print(f"  周波数範囲: {mel_freqs[0]:.1f} Hz ～ {mel_freqs[-1]:.1f} Hz")
-print(f"  最初の10バンド: {mel_freqs[:10]}")
-print(f"  最後の10バンド: {mel_freqs[-10:]}")
-print(f"  3000Hz付近のバンド: {np.where((mel_freqs >= 2800) & (mel_freqs <= 3200))[0]}")
-print(f"  → 3000Hzは約 {np.argmin(np.abs(mel_freqs - 3000))} 番目のバンド")
-
 train_files = natsorted(glob.glob('data/train_sound_*/train_sound_*/train_*.au'))
-print(f"\n学習ファイル数: {len(train_files)}")
-
-X_all, max_frames_train = load_and_pad(train_files)
-y_all = train_master['label_id'].values
-print(f"X_all shape: {X_all.shape}")  # (500, 128, max_frames)
-print(f"y_all shape: {y_all.shape}")
-
-print("\n=== テストデータの読み込み ===")
 test_files = natsorted(glob.glob('data/test_sound_*/test_sound_*/test_*.au'))
+print(f"学習ファイル数: {len(train_files)}")
 print(f"テストファイル数: {len(test_files)}")
 
-X_test_raw, max_frames_test = load_and_pad(test_files)
+print("\n=== 音源分離（Demucs） ===")
+from demucs.pretrained import get_model as get_demucs_model
+
+print(f"Demucsモデル ({SEPARATION_MODEL}) をロード中...")
+demucs_model = get_demucs_model(SEPARATION_MODEL)
+demucs_model.to(DEVICE)
+print(f"Demucsソース: {demucs_model.sources}")
+print(f"Demucsサンプルレート: {demucs_model.samplerate} Hz")
+
+print("\n学習データの音源分離:")
+batch_separate(train_files, demucs_model, SEPARATION_CACHE_DIR, SR, DEVICE)
+
+print("\nテストデータの音源分離:")
+batch_separate(test_files, demucs_model, SEPARATION_CACHE_DIR, SR, DEVICE)
+
+# Demucsモデルを解放してGPUメモリを確保
+del demucs_model
+if torch.cuda.is_available():
+    torch.cuda.empty_cache()
+print("\nDemucsモデルを解放しました")
+
+# ==============================================================================
+# 3チャンネル メルスペクトログラム抽出
+# ==============================================================================
+print("\n=== 3チャンネル メルスペクトログラム抽出 ===")
+mel_freqs = librosa.mel_frequencies(n_mels=N_MELS, fmin=0.0, fmax=SR / 2.0)
+print(f"メル周波数バンド: {N_MELS}バンド, {mel_freqs[0]:.1f} - {mel_freqs[-1]:.1f} Hz")
+
+print("\n学習データ:")
+X_all, max_frames_train = load_and_pad_3ch(train_files, SEPARATION_CACHE_DIR, SR, N_MELS)
+y_all = train_master['label_id'].values
+print(f"X_all shape: {X_all.shape}")  # (N, 3, n_mels, max_frames)
+print(f"y_all shape: {y_all.shape}")
+
+print("\nテストデータ:")
+X_test_raw, max_frames_test = load_and_pad_3ch(test_files, SEPARATION_CACHE_DIR, SR, N_MELS)
+
 # テストデータのフレーム数を学習データに合わせる
 if max_frames_test > max_frames_train:
-    X_test_raw = X_test_raw[:, :, :max_frames_train]
+    X_test_raw = X_test_raw[:, :, :, :max_frames_train]
 elif max_frames_test < max_frames_train:
     pad_width = max_frames_train - max_frames_test
-    X_test_raw = np.pad(X_test_raw, ((0, 0), (0, 0), (0, pad_width)),
+    X_test_raw = np.pad(X_test_raw,
+                        ((0, 0), (0, 0), (0, 0), (0, pad_width)),
                         mode='constant', constant_values=X_test_raw.min())
 print(f"X_test shape: {X_test_raw.shape}")
 
+
 # ==============================================================================
-# Dataset
+# Dataset（3チャンネル対応）
 # ==============================================================================
 class MelSpectrogramDataset(Dataset):
-    """メルスペクトログラムを3チャネル画像に変換して返すDataset"""
+    """3チャンネル（原音・伴奏・ボーカル）メルスペクトログラム Dataset
 
-    def __init__(self, X, file_list=None, y=None, img_size=IMG_SIZE, augment=False, sr=SR, n_mels=N_MELS, max_frames=None):
-        self.X = X  # (N, n_mels, time_frames) - augment=Falseの時用
-        self.file_list = file_list  # 音声ファイルパス - augment=Trueの時用
+    ch0 = Original（原音）
+    ch1 = Accompaniment（伴奏）
+    ch2 = Vocals（ボーカル）
+    """
+
+    def __init__(self, X, file_list=None, y=None, img_size=IMG_SIZE,
+                 augment=False, sr=SR, n_mels=N_MELS, max_frames=None,
+                 cache_dir=SEPARATION_CACHE_DIR):
+        self.X = X  # (N, 3, n_mels, time_frames)
+        self.file_list = file_list
         self.y = y
         self.img_size = img_size
         self.augment = augment
         self.sr = sr
         self.n_mels = n_mels
-        self.max_frames = max_frames  # パディング用の最大フレーム数
+        self.max_frames = max_frames
+        self.cache_dir = cache_dir
 
-        # 正規化パラメータ（全データから計算）
-        self.mean = X.mean()
-        self.std = X.std()
+        # 正規化パラメータ（チャンネルごとに計算）
+        self.ch_means = np.array([X[:, ch].mean() for ch in range(3)])  # (3,)
+        self.ch_stds = np.array([X[:, ch].std() for ch in range(3)])    # (3,)
 
     def __len__(self):
-        return len(self.X) if self.file_list is None else len(self.file_list)
+        return len(self.X)
 
     def __getitem__(self, idx):
         if self.augment and self.file_list is not None:
-            # オーギュメンテーション時: 音声ファイルを読み込んでオーギュメンテーション適用
-            y, _ = librosa.load(self.file_list[idx], sr=self.sr)
-            y = augment_audio(y, sr=self.sr)
-            mel_db = extract_melspectrogram(y, sr=self.sr, n_mels=self.n_mels)
-            
+            # === オーギュメンテーションあり ===
+            # キャッシュから分離済み波形を読み込み
+            basename = os.path.splitext(os.path.basename(self.file_list[idx]))[0]
+            cache_path = os.path.join(self.cache_dir, f"{basename}.npz")
+            data = np.load(cache_path)
+
+            original = data['original'].copy()
+            accompaniment = data['accompaniment'].copy()
+            vocals = data['vocals'].copy()
+
+            # 同一パラメータで3チャンネルすべてをオーギュメント
+            aug_params = generate_augment_params(sr=self.sr)
+            noise_seed = np.random.randint(0, 2**31)
+
+            original = apply_augment(original, aug_params,
+                                     sr=self.sr, noise_seed=noise_seed)
+            accompaniment = apply_augment(accompaniment, aug_params,
+                                          sr=self.sr, noise_seed=noise_seed)
+            vocals = apply_augment(vocals, aug_params,
+                                   sr=self.sr, noise_seed=noise_seed)
+
+            # メルスペクトログラムに変換
+            mel_orig = extract_melspectrogram(original, sr=self.sr, n_mels=self.n_mels)
+            mel_acc = extract_melspectrogram(accompaniment, sr=self.sr, n_mels=self.n_mels)
+            mel_voc = extract_melspectrogram(vocals, sr=self.sr, n_mels=self.n_mels)
+
+            # フレーム数を揃える
+            min_frames = min(mel_orig.shape[1], mel_acc.shape[1], mel_voc.shape[1])
+            mel_orig = mel_orig[:, :min_frames]
+            mel_acc = mel_acc[:, :min_frames]
+            mel_voc = mel_voc[:, :min_frames]
+
+            mel_3ch = np.stack([mel_orig, mel_acc, mel_voc], axis=0)  # (3, n_mels, frames)
+
             # パディング
             if self.max_frames is not None:
-                pad_width = self.max_frames - mel_db.shape[1]
+                pad_width = self.max_frames - mel_3ch.shape[2]
                 if pad_width > 0:
-                    mel_db = np.pad(mel_db, ((0, 0), (0, pad_width)), 
-                                  mode='constant', constant_values=mel_db.min())
+                    mel_3ch = np.pad(mel_3ch,
+                                     ((0, 0), (0, 0), (0, pad_width)),
+                                     mode='constant', constant_values=mel_3ch.min())
                 elif pad_width < 0:
-                    mel_db = mel_db[:, :self.max_frames]
-            
-            mel = mel_db
+                    mel_3ch = mel_3ch[:, :, :self.max_frames]
         else:
-            # オーギュメンテーションなし: 事前に抽出したメルスペクトログラムを使用
-            mel = self.X[idx].copy()  # (n_mels, time_frames)
+            # === オーギュメンテーションなし ===
+            mel_3ch = self.X[idx].copy()  # (3, n_mels, time_frames)
 
-        # 標準化
-        mel = (mel - self.mean) / (self.std + 1e-8)
+        # チャンネルごとに標準化
+        for ch in range(3):
+            mel_3ch[ch] = (mel_3ch[ch] - self.ch_means[ch]) / (self.ch_stds[ch] + 1e-8)
 
-        # SpecAugment（メルスペクトログラムベースのオーギュメンテーション）
+        # SpecAugment（3チャンネルに同じマスクを適用）
         if self.augment:
-            # Time masking: ランダムに時間方向の一部をマスク
+            # Time masking
             if config.AUGMENT_TIME_MASKING and np.random.random() < 0.5:
-                t = mel.shape[1]
+                t = mel_3ch.shape[2]
                 t_mask = np.random.randint(0, max(1, t // 10))
                 t_start = np.random.randint(0, max(1, t - t_mask))
-                mel[:, t_start:t_start + t_mask] = 0
+                mel_3ch[:, :, t_start:t_start + t_mask] = 0
 
-            # Frequency masking: ランダムに周波数方向の一部をマスク
+            # Frequency masking
             if config.AUGMENT_FREQUENCY_MASKING and np.random.random() < 0.5:
-                f = mel.shape[0]
+                f = mel_3ch.shape[1]
                 f_mask = np.random.randint(0, max(1, f // 10))
                 f_start = np.random.randint(0, max(1, f - f_mask))
-                mel[f_start:f_start + f_mask, :] = 0
+                mel_3ch[:, f_start:f_start + f_mask, :] = 0
 
-        # Tensor に変換 (1, H, W)
-        mel_tensor = torch.FloatTensor(mel).unsqueeze(0)
+        # Tensor に変換 (3, n_mels, time_frames)
+        mel_tensor = torch.FloatTensor(mel_3ch)
 
-        # リサイズ (1, H, W) -> (1, img_size, img_size)
+        # リサイズ (3, n_mels, time_frames) -> (3, img_size, img_size)
         mel_tensor = torch.nn.functional.interpolate(
             mel_tensor.unsqueeze(0), size=(self.img_size, self.img_size),
             mode='bilinear', align_corners=False
         ).squeeze(0)
-
-        # 1ch -> 3ch（EfficientNet は3チャネル入力）
-        mel_tensor = mel_tensor.repeat(3, 1, 1)  # (3, img_size, img_size)
 
         if self.y is not None:
             label = torch.LongTensor([self.y[idx]]).squeeze()
@@ -281,33 +491,33 @@ print(f"\nX_train: {X_train.shape}, X_valid: {X_valid.shape}")
 
 # 正規化パラメータは学習データから計算して共有
 train_dataset = MelSpectrogramDataset(
-    X_train, file_list=train_files_split, y=y_train, 
+    X_train, file_list=train_files_split, y=y_train,
     augment=True, max_frames=max_frames_train
 )
 valid_dataset = MelSpectrogramDataset(
-    X_valid, file_list=valid_files_split, y=y_valid, 
+    X_valid, file_list=valid_files_split, y=y_valid,
     augment=False, max_frames=max_frames_train
 )
-valid_dataset.mean = train_dataset.mean  # 学習データの統計量を使用
-valid_dataset.std = train_dataset.std
+valid_dataset.ch_means = train_dataset.ch_means
+valid_dataset.ch_stds = train_dataset.ch_stds
 
 test_dataset = MelSpectrogramDataset(
-    X_test_raw, file_list=test_files, y=None, 
+    X_test_raw, file_list=test_files, y=None,
     augment=False, max_frames=max_frames_train
 )
-test_dataset.mean = train_dataset.mean
-test_dataset.std = train_dataset.std
+test_dataset.ch_means = train_dataset.ch_means
+test_dataset.ch_stds = train_dataset.ch_stds
 
 train_loader = DataLoader(
-    train_dataset, batch_size=BATCH_SIZE, shuffle=True, 
+    train_dataset, batch_size=BATCH_SIZE, shuffle=True,
     num_workers=0, pin_memory=True if torch.cuda.is_available() else False
 )
 valid_loader = DataLoader(
-    valid_dataset, batch_size=BATCH_SIZE, shuffle=False, 
+    valid_dataset, batch_size=BATCH_SIZE, shuffle=False,
     num_workers=0, pin_memory=True if torch.cuda.is_available() else False
 )
 test_loader = DataLoader(
-    test_dataset, batch_size=BATCH_SIZE, shuffle=False, 
+    test_dataset, batch_size=BATCH_SIZE, shuffle=False,
     num_workers=0, pin_memory=True if torch.cuda.is_available() else False
 )
 
@@ -315,7 +525,13 @@ test_loader = DataLoader(
 # モデル定義: EfficientNet B7
 # ==============================================================================
 def build_model(num_classes=NUM_CLASSES):
-    """事前学習済み EfficientNet B7 を Fine-tuning 用に構築"""
+    """事前学習済み EfficientNet B7 を Fine-tuning 用に構築
+
+    3チャンネル入力:
+        ch0 = 原音メルスペクトログラム
+        ch1 = 伴奏メルスペクトログラム
+        ch2 = ボーカルメルスペクトログラム
+    """
     model = models.efficientnet_b7(weights=models.EfficientNet_B7_Weights.IMAGENET1K_V1)
 
     # 前半の層をフリーズ（過学習防止）
@@ -360,22 +576,19 @@ def train_one_epoch(model, loader, criterion, optimizer):
     for batch_idx, (X_batch, y_batch) in enumerate(loader):
         X_batch, y_batch = X_batch.to(DEVICE, non_blocking=True), y_batch.to(DEVICE, non_blocking=True)
 
-        optimizer.zero_grad(set_to_none=True)  # メモリ効率向上
+        optimizer.zero_grad(set_to_none=True)
         outputs = model(X_batch)
         loss = criterion(outputs, y_batch)
         loss.backward()
         optimizer.step()
 
-        # メモリリーク対策: 計算結果をCPUに移してから削除
         total_loss += loss.detach().item() * len(y_batch)
         preds = outputs.detach().argmax(dim=1).cpu().numpy()
         all_preds.extend(preds)
         all_labels.extend(y_batch.cpu().numpy())
 
-        # 明示的にメモリ解放
         del outputs, loss, X_batch, y_batch
 
-        # 定期的にキャッシュクリア（100バッチごと）
         if (batch_idx + 1) % 100 == 0 and torch.cuda.is_available():
             torch.cuda.empty_cache()
 
@@ -401,10 +614,8 @@ def evaluate(model, loader, criterion):
         all_preds.extend(preds)
         all_labels.extend(y_batch.cpu().numpy())
 
-        # 明示的にメモリ解放
         del outputs, loss, X_batch, y_batch
 
-    # 評価後はキャッシュクリア
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
@@ -416,8 +627,6 @@ def evaluate(model, loader, criterion):
 # ==============================================================================
 # チェックポイント管理
 # ==============================================================================
-# CHECKPOINT_FILE, BEST_MODEL_FILE, SUBMIT_FILE は config.py から読み込み済み
-
 def save_checkpoint(epoch, model, optimizer, scheduler, best_valid_acc, best_epoch, patience_counter):
     """チェックポイントを保存"""
     checkpoint = {
@@ -434,21 +643,14 @@ def save_checkpoint(epoch, model, optimizer, scheduler, best_valid_acc, best_epo
 
 
 def load_checkpoint(model, optimizer, scheduler, load_optimizer=True, load_scheduler=True):
-    """チェックポイントから学習を再開
-    
-    Args:
-        load_optimizer: 最適化器の状態も読み込むか（新実装ではFalse推奨）
-        load_scheduler: スケジューラの状態も読み込むか（新実装ではFalse推奨）
-    """
+    """チェックポイントから学習を再開"""
     if os.path.exists(CHECKPOINT_FILE):
         print(f"チェックポイントを読み込み: {CHECKPOINT_FILE}")
         checkpoint = torch.load(CHECKPOINT_FILE, map_location=DEVICE)
-        
-        # モデルの重みは常に読み込む
+
         model.load_state_dict(checkpoint['model_state_dict'])
         print(f"  → モデルの重みを読み込みました")
-        
-        # 最適化器の状態（オプション）
+
         if load_optimizer and 'optimizer_state_dict' in checkpoint:
             try:
                 optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
@@ -458,8 +660,7 @@ def load_checkpoint(model, optimizer, scheduler, load_optimizer=True, load_sched
                 print(f"  → 最適化器は初期状態から開始します")
         else:
             print(f"  → 最適化器は初期状態から開始します（設定によりスキップ）")
-        
-        # スケジューラの状態（オプション）
+
         if load_scheduler and 'scheduler_state_dict' in checkpoint:
             try:
                 scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
@@ -469,12 +670,12 @@ def load_checkpoint(model, optimizer, scheduler, load_optimizer=True, load_sched
                 print(f"  → スケジューラは初期状態から開始します")
         else:
             print(f"  → スケジューラは初期状態から開始します（設定によりスキップ）")
-        
+
         start_epoch = checkpoint.get('epoch', 0) + 1
         best_valid_acc = checkpoint.get('best_valid_acc', 0)
         best_epoch = checkpoint.get('best_epoch', 0)
         patience_counter = checkpoint.get('patience_counter', 0)
-        
+
         print(f"  → 再開: epoch {start_epoch} から")
         print(f"  → ベスト精度: {best_valid_acc:.4f} (epoch {best_epoch})")
         return start_epoch, best_valid_acc, best_epoch, patience_counter
@@ -496,11 +697,10 @@ signal.signal(signal.SIGTERM, signal_handler)
 # ==============================================================================
 print("\n=== 学習開始 ===")
 
-# チェックポイントから再開（あれば）
 if RESUME_FROM_CHECKPOINT:
     start_epoch, best_valid_acc, best_epoch, patience_counter = load_checkpoint(
-        model, optimizer, scheduler, 
-        load_optimizer=LOAD_OPTIMIZER_STATE, 
+        model, optimizer, scheduler,
+        load_optimizer=LOAD_OPTIMIZER_STATE,
         load_scheduler=LOAD_SCHEDULER_STATE
     )
 else:
@@ -517,12 +717,13 @@ print(f"  最大エポック: {EPOCHS}")
 print(f"  バッチサイズ: {BATCH_SIZE}")
 print(f"  学習データ数: {len(train_dataset)}")
 print(f"  検証データ数: {len(valid_dataset)}")
+print(f"  入力チャンネル: 3ch (原音 / 伴奏 / ボーカル)")
 print(f"  デバイス: {DEVICE}")
 
 try:
     for epoch in range(start_epoch, EPOCHS + 1):
         current_epoch = epoch
-        
+
         if interrupted:
             print("\n学習を中断します...")
             save_checkpoint(epoch - 1, model, optimizer, scheduler, best_valid_acc, best_epoch, patience_counter)
@@ -540,23 +741,19 @@ try:
               f"Valid Loss: {valid_loss:.4f} Acc: {valid_acc:.4f} | "
               f"LR: {lr:.6f}")
 
-        # ベストモデル保存
         if valid_acc > best_valid_acc:
             best_valid_acc = valid_acc
             best_epoch = epoch
             patience_counter = 0
             torch.save(model.state_dict(), BEST_MODEL_FILE)
-            # ベストモデル更新時のみチェックポイントも保存
             save_checkpoint(epoch, model, optimizer, scheduler, best_valid_acc, best_epoch, patience_counter)
             print(f"  → ベストモデル更新 (Valid Acc: {best_valid_acc:.4f})")
         else:
             patience_counter += 1
 
-        # エポック終了後にメモリクリア
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-        # Early Stopping
         if patience_counter >= patience:
             print(f"\nEarly Stopping at epoch {epoch} (ベスト: epoch {best_epoch})")
             break
@@ -579,7 +776,6 @@ except Exception as e:
     sys.exit(1)
 
 finally:
-    # GPUメモリをクリア
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
         print("GPUメモリをクリアしました。")
@@ -609,11 +805,9 @@ with torch.no_grad():
         outputs = model(X_batch)
         preds = outputs.argmax(dim=1).cpu().numpy()
         all_preds.extend(preds)
-        
-        # メモリ解放
+
         del outputs, X_batch
 
-# 推論後もメモリクリア
 if torch.cuda.is_available():
     torch.cuda.empty_cache()
 
