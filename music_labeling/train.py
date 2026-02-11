@@ -24,19 +24,28 @@ from sklearn.metrics import accuracy_score
 import warnings
 warnings.simplefilter('ignore')
 
-# ==============================================================================
-# 設定
-# ==============================================================================
-SEED = 42
-N_MELS = 128
-SR = 22050
-IMG_SIZE = 600           # EfficientNet B7 の標準入力サイズ
-BATCH_SIZE = 24          # RTX3090 (24GB) なら16-24が可能。メモリ不足時は下げる
-EPOCHS = 50
-LR = 2e-4                # バッチサイズ増加に伴い学習率も調整（Linear Scaling: 4→16で4倍）
-WEIGHT_DECAY = 1e-4
-NUM_CLASSES = 10
-TEST_SIZE = 0.1
+# 設定ファイルからインポート
+import config
+
+# 設定をconfigから取得
+SEED = config.SEED
+N_MELS = config.N_MELS
+SR = config.SR
+IMG_SIZE = config.IMG_SIZE
+BATCH_SIZE = config.BATCH_SIZE
+EPOCHS = config.EPOCHS
+LR = config.LR
+WEIGHT_DECAY = config.WEIGHT_DECAY
+NUM_CLASSES = config.NUM_CLASSES
+TEST_SIZE = config.TEST_SIZE
+RESUME_FROM_CHECKPOINT = config.RESUME_FROM_CHECKPOINT
+LOAD_OPTIMIZER_STATE = config.LOAD_OPTIMIZER_STATE
+LOAD_SCHEDULER_STATE = config.LOAD_SCHEDULER_STATE
+CHECKPOINT_FILE = config.CHECKPOINT_FILE
+BEST_MODEL_FILE = config.BEST_MODEL_FILE
+SUBMIT_FILE = config.SUBMIT_FILE
+PATIENCE = config.PATIENCE
+
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 np.random.seed(SEED)
@@ -64,36 +73,47 @@ def extract_melspectrogram(y, sr=SR, n_mels=None):
     return mel_db
 
 
-def augment_audio(y, sr=SR, pitch_shift=True, time_stretch=True, add_noise=True, time_shift=True):
+def augment_audio(y, sr=SR, 
+                  pitch_shift=None, time_stretch=None, add_noise=None, time_shift=None):
     """音声波形にオーギュメンテーションを適用
     
     Args:
         y: 音声波形データ
         sr: サンプリングレート
-        pitch_shift: ピッチシフトを適用するか
-        time_stretch: タイムストレッチを適用するか
-        add_noise: ノイズを追加するか
-        time_shift: タイムシフトを適用するか
+        pitch_shift: ピッチシフトを適用するか（Noneの場合はconfigから取得）
+        time_stretch: タイムストレッチを適用するか（Noneの場合はconfigから取得）
+        add_noise: ノイズを追加するか（Noneの場合はconfigから取得）
+        time_shift: タイムシフトを適用するか（Noneの場合はconfigから取得）
     """
-    # ピッチシフト（±2半音）
+    # デフォルト値をconfigから取得
+    if pitch_shift is None:
+        pitch_shift = config.AUGMENT_PITCH_SHIFT
+    if time_stretch is None:
+        time_stretch = config.AUGMENT_TIME_STRETCH
+    if add_noise is None:
+        add_noise = config.AUGMENT_ADD_NOISE
+    if time_shift is None:
+        time_shift = config.AUGMENT_TIME_SHIFT
+    
+    # ピッチシフト
     if pitch_shift and np.random.random() < 0.5:
-        n_steps = np.random.uniform(-2, 2)
+        n_steps = np.random.uniform(config.PITCH_SHIFT_MIN, config.PITCH_SHIFT_MAX)
         y = librosa.effects.pitch_shift(y=y, sr=sr, n_steps=n_steps)
     
-    # タイムストレッチ（0.8～1.2倍）
+    # タイムストレッチ
     if time_stretch and np.random.random() < 0.5:
-        rate = np.random.uniform(0.8, 1.2)
+        rate = np.random.uniform(config.TIME_STRETCH_MIN, config.TIME_STRETCH_MAX)
         y = librosa.effects.time_stretch(y=y, rate=rate)
     
     # ノイズ追加
     if add_noise and np.random.random() < 0.5:
-        noise_factor = np.random.uniform(0.001, 0.01)
+        noise_factor = np.random.uniform(config.NOISE_FACTOR_MIN, config.NOISE_FACTOR_MAX)
         noise = np.random.randn(len(y)) * noise_factor
         y = y + noise
     
-    # タイムシフト（前後にシフト）
+    # タイムシフト
     if time_shift and np.random.random() < 0.5:
-        shift_max = int(sr * 0.2)  # 最大0.2秒シフト
+        shift_max = int(sr * config.TIME_SHIFT_MAX_SEC)
         shift = np.random.randint(-shift_max, shift_max + 1)
         if shift > 0:
             # 右にシフト（前をゼロパディング）
@@ -210,14 +230,14 @@ class MelSpectrogramDataset(Dataset):
         # SpecAugment（メルスペクトログラムベースのオーギュメンテーション）
         if self.augment:
             # Time masking: ランダムに時間方向の一部をマスク
-            if np.random.random() < 0.5:
+            if config.AUGMENT_TIME_MASKING and np.random.random() < 0.5:
                 t = mel.shape[1]
                 t_mask = np.random.randint(0, max(1, t // 10))
                 t_start = np.random.randint(0, max(1, t - t_mask))
                 mel[:, t_start:t_start + t_mask] = 0
 
             # Frequency masking: ランダムに周波数方向の一部をマスク
-            if np.random.random() < 0.5:
+            if config.AUGMENT_FREQUENCY_MASKING and np.random.random() < 0.5:
                 f = mel.shape[0]
                 f_mask = np.random.randint(0, max(1, f // 10))
                 f_start = np.random.randint(0, max(1, f - f_mask))
@@ -396,8 +416,7 @@ def evaluate(model, loader, criterion):
 # ==============================================================================
 # チェックポイント管理
 # ==============================================================================
-CHECKPOINT_FILE = 'checkpoint.pth'
-BEST_MODEL_FILE = 'best_model.pth'
+# CHECKPOINT_FILE, BEST_MODEL_FILE, SUBMIT_FILE は config.py から読み込み済み
 
 def save_checkpoint(epoch, model, optimizer, scheduler, best_valid_acc, best_epoch, patience_counter):
     """チェックポイントを保存"""
@@ -414,19 +433,50 @@ def save_checkpoint(epoch, model, optimizer, scheduler, best_valid_acc, best_epo
     print(f"  → チェックポイント保存: {CHECKPOINT_FILE}")
 
 
-def load_checkpoint(model, optimizer, scheduler):
-    """チェックポイントから学習を再開"""
+def load_checkpoint(model, optimizer, scheduler, load_optimizer=True, load_scheduler=True):
+    """チェックポイントから学習を再開
+    
+    Args:
+        load_optimizer: 最適化器の状態も読み込むか（新実装ではFalse推奨）
+        load_scheduler: スケジューラの状態も読み込むか（新実装ではFalse推奨）
+    """
     if os.path.exists(CHECKPOINT_FILE):
         print(f"チェックポイントを読み込み: {CHECKPOINT_FILE}")
         checkpoint = torch.load(CHECKPOINT_FILE, map_location=DEVICE)
+        
+        # モデルの重みは常に読み込む
         model.load_state_dict(checkpoint['model_state_dict'])
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-        start_epoch = checkpoint['epoch'] + 1
-        best_valid_acc = checkpoint['best_valid_acc']
-        best_epoch = checkpoint['best_epoch']
-        patience_counter = checkpoint['patience_counter']
-        print(f"  再開: epoch {start_epoch} から")
+        print(f"  → モデルの重みを読み込みました")
+        
+        # 最適化器の状態（オプション）
+        if load_optimizer and 'optimizer_state_dict' in checkpoint:
+            try:
+                optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                print(f"  → 最適化器の状態を読み込みました")
+            except Exception as e:
+                print(f"  ⚠ 最適化器の状態の読み込みに失敗: {e}")
+                print(f"  → 最適化器は初期状態から開始します")
+        else:
+            print(f"  → 最適化器は初期状態から開始します（設定によりスキップ）")
+        
+        # スケジューラの状態（オプション）
+        if load_scheduler and 'scheduler_state_dict' in checkpoint:
+            try:
+                scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+                print(f"  → スケジューラの状態を読み込みました")
+            except Exception as e:
+                print(f"  ⚠ スケジューラの状態の読み込みに失敗: {e}")
+                print(f"  → スケジューラは初期状態から開始します")
+        else:
+            print(f"  → スケジューラは初期状態から開始します（設定によりスキップ）")
+        
+        start_epoch = checkpoint.get('epoch', 0) + 1
+        best_valid_acc = checkpoint.get('best_valid_acc', 0)
+        best_epoch = checkpoint.get('best_epoch', 0)
+        patience_counter = checkpoint.get('patience_counter', 0)
+        
+        print(f"  → 再開: epoch {start_epoch} から")
+        print(f"  → ベスト精度: {best_valid_acc:.4f} (epoch {best_epoch})")
         return start_epoch, best_valid_acc, best_epoch, patience_counter
     return 1, 0, 0, 0
 
@@ -447,10 +497,28 @@ signal.signal(signal.SIGTERM, signal_handler)
 print("\n=== 学習開始 ===")
 
 # チェックポイントから再開（あれば）
-start_epoch, best_valid_acc, best_epoch, patience_counter = load_checkpoint(model, optimizer, scheduler)
-patience = 10
+if RESUME_FROM_CHECKPOINT:
+    start_epoch, best_valid_acc, best_epoch, patience_counter = load_checkpoint(
+        model, optimizer, scheduler, 
+        load_optimizer=LOAD_OPTIMIZER_STATE, 
+        load_scheduler=LOAD_SCHEDULER_STATE
+    )
+else:
+    print("チェックポイントの読み込みをスキップします（最初から学習）")
+    start_epoch, best_valid_acc, best_epoch, patience_counter = 1, 0, 0, 0
+
+patience = PATIENCE
 
 current_epoch = start_epoch
+
+print(f"学習設定:")
+print(f"  開始エポック: {start_epoch}")
+print(f"  最大エポック: {EPOCHS}")
+print(f"  バッチサイズ: {BATCH_SIZE}")
+print(f"  学習データ数: {len(train_dataset)}")
+print(f"  検証データ数: {len(valid_dataset)}")
+print(f"  デバイス: {DEVICE}")
+
 try:
     for epoch in range(start_epoch, EPOCHS + 1):
         current_epoch = epoch
@@ -460,7 +528,9 @@ try:
             save_checkpoint(epoch - 1, model, optimizer, scheduler, best_valid_acc, best_epoch, patience_counter)
             break
 
+        print(f"Epoch {epoch} の学習を開始...")
         train_loss, train_acc = train_one_epoch(model, train_loader, criterion, optimizer)
+        print(f"Epoch {epoch} の評価を開始...")
         valid_loss, valid_acc = evaluate(model, valid_loader, criterion)
         scheduler.step()
 
@@ -498,6 +568,15 @@ except KeyboardInterrupt:
     print("\n\nCtrl+Cで中断されました。チェックポイントを保存します...")
     save_checkpoint(current_epoch - 1, model, optimizer, scheduler, best_valid_acc, best_epoch, patience_counter)
     print("チェックポイント保存完了。次回は同じスクリプトで再開できます。")
+except Exception as e:
+    print(f"\n\nエラーが発生しました: {type(e).__name__}")
+    print(f"エラーメッセージ: {str(e)}")
+    import traceback
+    traceback.print_exc()
+    print("\nチェックポイントを保存します...")
+    if current_epoch > start_epoch:
+        save_checkpoint(current_epoch - 1, model, optimizer, scheduler, best_valid_acc, best_epoch, patience_counter)
+    sys.exit(1)
 
 finally:
     # GPUメモリをクリア
@@ -544,6 +623,6 @@ submit_df = pd.DataFrame({
     0: test_file_names,
     1: all_preds
 })
-submit_df.to_csv('submit.csv', index=False, header=False)
-print(f"提出ファイル作成完了: submit.csv ({len(submit_df)} 件)")
+submit_df.to_csv(SUBMIT_FILE, index=False, header=False)
+print(f"提出ファイル作成完了: {SUBMIT_FILE} ({len(submit_df)} 件)")
 print(submit_df.head(10))

@@ -92,12 +92,30 @@ python train.py
 python train.py  # 自動でcheckpoint.pthから再開
 ```
 
+**⚠️ 重要な注意点**: 新しい実装（データオーギュメンテーション追加など）で学習を再開する場合、過去のチェックポイントの最適化器・スケジューラの状態は古い実装に基づいているため、問題が発生する可能性があります。
+
+`train.py`の設定で以下を調整してください：
+
+```python
+RESUME_FROM_CHECKPOINT = True      # チェックポイントから再開するか
+LOAD_OPTIMIZER_STATE = False       # 最適化器の状態も読み込むか（新実装ではFalse推奨）
+LOAD_SCHEDULER_STATE = False      # スケジューラの状態も読み込むか（新実装ではFalse推奨）
+```
+
+**推奨設定**:
+- 新しい実装で再開する場合: `LOAD_OPTIMIZER_STATE = False`, `LOAD_SCHEDULER_STATE = False`
+  - モデルの重みのみを読み込み、最適化器とスケジューラは初期化
+- 同じ実装で再開する場合: `LOAD_OPTIMIZER_STATE = True`, `LOAD_SCHEDULER_STATE = True`
+  - すべての状態を読み込んで完全に再開
+
 ### 最初からやり直す場合
 
 ```bash
 rm checkpoint.pth best_model.pth
 python train.py
 ```
+
+または、`train.py`で `RESUME_FROM_CHECKPOINT = False` に設定
 
 ## ⚙️ 設定パラメータ
 
