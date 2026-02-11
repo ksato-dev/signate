@@ -120,5 +120,3 @@ X_train, X_valid, y_train, y_valid = train_test_split(
 )
 print(f"\nX_train: {X_train.shape}, X_valid: {X_valid.shape}")
 print(f"y_train: {y_train.shape}, y_valid: {y_valid.shape}")
-
-# 分類器の実装

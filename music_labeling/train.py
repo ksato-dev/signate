@@ -49,13 +49,14 @@ print(f"Device: {DEVICE}")
 # ==============================================================================
 # データ読み込み・メルスペクトログラム抽出
 # ==============================================================================
-def extract_melspectrogram(file_path, sr=SR, n_mels=None):
-    """音声ファイルからメルスペクトログラム(dB)を抽出
+def extract_melspectrogram(y, sr=SR, n_mels=None):
+    """音声波形からメルスペクトログラム(dB)を抽出
     
     Args:
+        y: 音声波形データ
+        sr: サンプリングレート
         n_mels: メルバンド数。Noneの場合はlibrosaのデフォルト値(128)を使用
     """
-    y, sr = librosa.load(file_path, sr=sr)
     # n_melsがNoneの場合はデフォルト値を使用（128）
     kwargs = {} if n_mels is None else {'n_mels': n_mels}
     mel = librosa.feature.melspectrogram(y=y, sr=sr, **kwargs)
@@ -63,11 +64,53 @@ def extract_melspectrogram(file_path, sr=SR, n_mels=None):
     return mel_db
 
 
+def augment_audio(y, sr=SR, pitch_shift=True, time_stretch=True, add_noise=True, time_shift=True):
+    """音声波形にオーギュメンテーションを適用
+    
+    Args:
+        y: 音声波形データ
+        sr: サンプリングレート
+        pitch_shift: ピッチシフトを適用するか
+        time_stretch: タイムストレッチを適用するか
+        add_noise: ノイズを追加するか
+        time_shift: タイムシフトを適用するか
+    """
+    # ピッチシフト（±2半音）
+    if pitch_shift and np.random.random() < 0.5:
+        n_steps = np.random.uniform(-2, 2)
+        y = librosa.effects.pitch_shift(y=y, sr=sr, n_steps=n_steps)
+    
+    # タイムストレッチ（0.8～1.2倍）
+    if time_stretch and np.random.random() < 0.5:
+        rate = np.random.uniform(0.8, 1.2)
+        y = librosa.effects.time_stretch(y=y, rate=rate)
+    
+    # ノイズ追加
+    if add_noise and np.random.random() < 0.5:
+        noise_factor = np.random.uniform(0.001, 0.01)
+        noise = np.random.randn(len(y)) * noise_factor
+        y = y + noise
+    
+    # タイムシフト（前後にシフト）
+    if time_shift and np.random.random() < 0.5:
+        shift_max = int(sr * 0.2)  # 最大0.2秒シフト
+        shift = np.random.randint(-shift_max, shift_max + 1)
+        if shift > 0:
+            # 右にシフト（前をゼロパディング）
+            y = np.pad(y, (shift, 0), mode='constant')[:-shift]
+        elif shift < 0:
+            # 左にシフト（後をゼロパディング）
+            y = np.pad(y, (0, -shift), mode='constant')[-shift:]
+    
+    return y
+
+
 def load_and_pad(file_list, sr=SR, n_mels=N_MELS):
     """音声ファイル群からメルスペクトログラムを抽出し、パディングして統一サイズにする"""
     spectrograms = []
     for f in file_list:
-        mel_db = extract_melspectrogram(f, sr=sr, n_mels=n_mels)
+        y, _ = librosa.load(f, sr=sr)
+        mel_db = extract_melspectrogram(y, sr=sr, n_mels=n_mels)
         spectrograms.append(mel_db)
 
     # 最大フレーム数に合わせてパディング
@@ -123,26 +166,48 @@ print(f"X_test shape: {X_test_raw.shape}")
 class MelSpectrogramDataset(Dataset):
     """メルスペクトログラムを3チャネル画像に変換して返すDataset"""
 
-    def __init__(self, X, y=None, img_size=IMG_SIZE, augment=False):
-        self.X = X  # (N, n_mels, time_frames)
+    def __init__(self, X, file_list=None, y=None, img_size=IMG_SIZE, augment=False, sr=SR, n_mels=N_MELS, max_frames=None):
+        self.X = X  # (N, n_mels, time_frames) - augment=Falseの時用
+        self.file_list = file_list  # 音声ファイルパス - augment=Trueの時用
         self.y = y
         self.img_size = img_size
         self.augment = augment
+        self.sr = sr
+        self.n_mels = n_mels
+        self.max_frames = max_frames  # パディング用の最大フレーム数
 
         # 正規化パラメータ（全データから計算）
         self.mean = X.mean()
         self.std = X.std()
 
     def __len__(self):
-        return len(self.X)
+        return len(self.X) if self.file_list is None else len(self.file_list)
 
     def __getitem__(self, idx):
-        mel = self.X[idx].copy()  # (n_mels, time_frames)
+        if self.augment and self.file_list is not None:
+            # オーギュメンテーション時: 音声ファイルを読み込んでオーギュメンテーション適用
+            y, _ = librosa.load(self.file_list[idx], sr=self.sr)
+            y = augment_audio(y, sr=self.sr)
+            mel_db = extract_melspectrogram(y, sr=self.sr, n_mels=self.n_mels)
+            
+            # パディング
+            if self.max_frames is not None:
+                pad_width = self.max_frames - mel_db.shape[1]
+                if pad_width > 0:
+                    mel_db = np.pad(mel_db, ((0, 0), (0, pad_width)), 
+                                  mode='constant', constant_values=mel_db.min())
+                elif pad_width < 0:
+                    mel_db = mel_db[:, :self.max_frames]
+            
+            mel = mel_db
+        else:
+            # オーギュメンテーションなし: 事前に抽出したメルスペクトログラムを使用
+            mel = self.X[idx].copy()  # (n_mels, time_frames)
 
         # 標準化
         mel = (mel - self.mean) / (self.std + 1e-8)
 
-        # Data Augmentation（学習時のみ）
+        # SpecAugment（メルスペクトログラムベースのオーギュメンテーション）
         if self.augment:
             # Time masking: ランダムに時間方向の一部をマスク
             if np.random.random() < 0.5:
@@ -180,18 +245,36 @@ class MelSpectrogramDataset(Dataset):
 # ==============================================================================
 # Train / Valid 分割
 # ==============================================================================
-X_train, X_valid, y_train, y_valid = train_test_split(
-    X_all, y_all, test_size=TEST_SIZE, random_state=SEED, stratify=y_all
+indices = np.arange(len(X_all))
+train_indices, valid_indices = train_test_split(
+    indices, test_size=TEST_SIZE, random_state=SEED, stratify=y_all
 )
+
+X_train = X_all[train_indices]
+X_valid = X_all[valid_indices]
+y_train = y_all[train_indices]
+y_valid = y_all[valid_indices]
+train_files_split = [train_files[i] for i in train_indices]
+valid_files_split = [train_files[i] for i in valid_indices]
+
 print(f"\nX_train: {X_train.shape}, X_valid: {X_valid.shape}")
 
 # 正規化パラメータは学習データから計算して共有
-train_dataset = MelSpectrogramDataset(X_train, y_train, augment=True)
-valid_dataset = MelSpectrogramDataset(X_valid, y_valid, augment=False)
+train_dataset = MelSpectrogramDataset(
+    X_train, file_list=train_files_split, y=y_train, 
+    augment=True, max_frames=max_frames_train
+)
+valid_dataset = MelSpectrogramDataset(
+    X_valid, file_list=valid_files_split, y=y_valid, 
+    augment=False, max_frames=max_frames_train
+)
 valid_dataset.mean = train_dataset.mean  # 学習データの統計量を使用
 valid_dataset.std = train_dataset.std
 
-test_dataset = MelSpectrogramDataset(X_test_raw, y=None, augment=False)
+test_dataset = MelSpectrogramDataset(
+    X_test_raw, file_list=test_files, y=None, 
+    augment=False, max_frames=max_frames_train
+)
 test_dataset.mean = train_dataset.mean
 test_dataset.std = train_dataset.std
 
