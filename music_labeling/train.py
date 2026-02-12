@@ -202,10 +202,13 @@ def extract_melspectrogram(y, sr=SR, n_mels=None):
         sr: サンプリングレート
         n_mels: メルバンド数。Noneの場合はlibrosaのデフォルト値(128)を使用
     """
+    n_fft = 2048
+    hop_length = 512
     kwargs = {} if n_mels is None else {'n_mels': n_mels}
-    mel = librosa.feature.melspectrogram(y=y, sr=sr, **kwargs)
-    mel_db = librosa.amplitude_to_db(mel, ref=np.max)
+    mel = librosa.feature.melspectrogram(y=y, sr=sr, n_fft=n_fft, hop_length=hop_length, **kwargs)
+    mel_db = librosa.power_to_db(mel, ref=np.max)
     return mel_db
+
 
 
 # ==============================================================================
@@ -324,64 +327,116 @@ def load_and_pad_3ch(file_list, cache_dir=SEPARATION_CACHE_DIR, sr=SR, n_mels=N_
     return np.array(padded), max_frames
 
 
+def load_mel_cache_if_valid(train_files, test_files, cache_path=None):
+    """事前計算済みメルスペクトログラムキャッシュがあればロードする。
+    ファイルリストが一致する場合のみ有効。不一致なら None を返す。
+    Returns:
+        (X_all, X_test_raw, max_frames_train) or None if cache miss
+    """
+    cache_path = cache_path or getattr(config, 'MEL_CACHE_FILE', 'data/precomputed_mel.npz')
+    if not os.path.isfile(cache_path):
+        return None
+    train_basenames = [os.path.splitext(os.path.basename(f))[0] for f in train_files]
+    test_basenames = [os.path.splitext(os.path.basename(f))[0] for f in test_files]
+    try:
+        data = np.load(cache_path, allow_pickle=True)
+        cached_train = list(data.get('train_basenames', []))
+        cached_test = list(data.get('test_basenames', []))
+        if cached_train != train_basenames or cached_test != test_basenames:
+            return None
+        X_all = data['X_all']
+        X_test_raw = data['X_test_raw']
+        max_frames_train = int(data['max_frames_train'])
+        return X_all, X_test_raw, max_frames_train
+    except Exception:
+        return None
+
+
+def save_mel_cache(X_all, X_test_raw, max_frames_train, train_files, test_files, cache_path=None):
+    """事前計算済みメルスペクトログラムをキャッシュに保存する。"""
+    cache_path = cache_path or getattr(config, 'MEL_CACHE_FILE', 'data/precomputed_mel.npz')
+    train_basenames = [os.path.splitext(os.path.basename(f))[0] for f in train_files]
+    test_basenames = [os.path.splitext(os.path.basename(f))[0] for f in test_files]
+    os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+    np.savez_compressed(
+        cache_path,
+        X_all=X_all,
+        X_test_raw=X_test_raw,
+        max_frames_train=np.int64(max_frames_train),
+        train_basenames=np.array(train_basenames, dtype=object),
+        test_basenames=np.array(test_basenames, dtype=object),
+    )
+
+
 # ==============================================================================
-# 音源分離の実行
+# 音源分離の実行（Windows multiprocessing のため __main__ 内で実行）
 # ==============================================================================
-print("=== データファイルの読み込み ===")
-train_master = pd.read_csv('data/train_master.csv', index_col=0)
-label_master = pd.read_csv('data/label_master.csv')
+if __name__ == '__main__':
+    print("=== データファイルの読み込み ===")
+    train_master = pd.read_csv('data/train_master.csv', index_col=0)
+    label_master = pd.read_csv('data/label_master.csv')
 
-train_files = natsorted(glob.glob('data/train_sound_*/train_sound_*/train_*.au'))
-test_files = natsorted(glob.glob('data/test_sound_*/test_sound_*/test_*.au'))
-print(f"学習ファイル数: {len(train_files)}")
-print(f"テストファイル数: {len(test_files)}")
+    train_files = natsorted(glob.glob('data/train_sound_*/train_sound_*/train_*.au'))
+    test_files = natsorted(glob.glob('data/test_sound_*/test_sound_*/test_*.au'))
+    print(f"学習ファイル数: {len(train_files)}")
+    print(f"テストファイル数: {len(test_files)}")
 
-print("\n=== 音源分離（Demucs） ===")
-from demucs.pretrained import get_model as get_demucs_model
+    print("\n=== 音源分離（Demucs） ===")
+    from demucs.pretrained import get_model as get_demucs_model
 
-print(f"Demucsモデル ({SEPARATION_MODEL}) をロード中...")
-demucs_model = get_demucs_model(SEPARATION_MODEL)
-demucs_model.to(DEVICE)
-print(f"Demucsソース: {demucs_model.sources}")
-print(f"Demucsサンプルレート: {demucs_model.samplerate} Hz")
+    print(f"Demucsモデル ({SEPARATION_MODEL}) をロード中...")
+    demucs_model = get_demucs_model(SEPARATION_MODEL)
+    demucs_model.to(DEVICE)
+    print(f"Demucsソース: {demucs_model.sources}")
+    print(f"Demucsサンプルレート: {demucs_model.samplerate} Hz")
 
-print("\n学習データの音源分離:")
-batch_separate(train_files, demucs_model, SEPARATION_CACHE_DIR, SR, DEVICE)
+    print("\n学習データの音源分離:")
+    batch_separate(train_files, demucs_model, SEPARATION_CACHE_DIR, SR, DEVICE)
 
-print("\nテストデータの音源分離:")
-batch_separate(test_files, demucs_model, SEPARATION_CACHE_DIR, SR, DEVICE)
+    print("\nテストデータの音源分離:")
+    batch_separate(test_files, demucs_model, SEPARATION_CACHE_DIR, SR, DEVICE)
 
-# Demucsモデルを解放してGPUメモリを確保
-del demucs_model
-if torch.cuda.is_available():
-    torch.cuda.empty_cache()
-print("\nDemucsモデルを解放しました")
+    # Demucsモデルを解放してGPUメモリを確保
+    del demucs_model
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    print("\nDemucsモデルを解放しました")
 
-# ==============================================================================
-# 3チャンネル メルスペクトログラム抽出
-# ==============================================================================
-print("\n=== 3チャンネル メルスペクトログラム抽出 ===")
-mel_freqs = librosa.mel_frequencies(n_mels=N_MELS, fmin=0.0, fmax=SR / 2.0)
-print(f"メル周波数バンド: {N_MELS}バンド, {mel_freqs[0]:.1f} - {mel_freqs[-1]:.1f} Hz")
+    # ==============================================================================
+    # 3チャンネル メルスペクトログラム（キャッシュがあればロード短縮）
+    # ==============================================================================
+    mel_cache_path = getattr(config, 'MEL_CACHE_FILE', 'data/precomputed_mel.npz')
+    cached = load_mel_cache_if_valid(train_files, test_files, mel_cache_path)
+    if cached is not None:
+        X_all, X_test_raw, max_frames_train = cached
+        print("\n=== 3チャンネル メルスペクトログラム（事前キャッシュからロード） ===")
+        print(f"X_all shape: {X_all.shape}, X_test shape: {X_test_raw.shape}, max_frames: {max_frames_train}")
+    else:
+        print("\n=== 3チャンネル メルスペクトログラム抽出 ===")
+        mel_freqs = librosa.mel_frequencies(n_mels=N_MELS, fmin=0.0, fmax=SR / 2.0)
+        print(f"メル周波数バンド: {N_MELS}バンド, {mel_freqs[0]:.1f} - {mel_freqs[-1]:.1f} Hz")
 
-print("\n学習データ:")
-X_all, max_frames_train = load_and_pad_3ch(train_files, SEPARATION_CACHE_DIR, SR, N_MELS)
-y_all = train_master['label_id'].values
-print(f"X_all shape: {X_all.shape}")  # (N, 3, n_mels, max_frames)
-print(f"y_all shape: {y_all.shape}")
+        print("\n学習データ:")
+        X_all, max_frames_train = load_and_pad_3ch(train_files, SEPARATION_CACHE_DIR, SR, N_MELS)
+        print(f"X_all shape: {X_all.shape}")
 
-print("\nテストデータ:")
-X_test_raw, max_frames_test = load_and_pad_3ch(test_files, SEPARATION_CACHE_DIR, SR, N_MELS)
+        print("\nテストデータ:")
+        X_test_raw, max_frames_test = load_and_pad_3ch(test_files, SEPARATION_CACHE_DIR, SR, N_MELS)
 
-# テストデータのフレーム数を学習データに合わせる
-if max_frames_test > max_frames_train:
-    X_test_raw = X_test_raw[:, :, :, :max_frames_train]
-elif max_frames_test < max_frames_train:
-    pad_width = max_frames_train - max_frames_test
-    X_test_raw = np.pad(X_test_raw,
-                        ((0, 0), (0, 0), (0, 0), (0, pad_width)),
-                        mode='constant', constant_values=X_test_raw.min())
-print(f"X_test shape: {X_test_raw.shape}")
+        # テストデータのフレーム数を学習データに合わせる
+        if max_frames_test > max_frames_train:
+            X_test_raw = X_test_raw[:, :, :, :max_frames_train]
+        elif max_frames_test < max_frames_train:
+            pad_width = max_frames_train - max_frames_test
+            X_test_raw = np.pad(X_test_raw,
+                                ((0, 0), (0, 0), (0, 0), (0, pad_width)),
+                                mode='constant', constant_values=X_test_raw.min())
+        print(f"X_test shape: {X_test_raw.shape}")
+        save_mel_cache(X_all, X_test_raw, max_frames_train, train_files, test_files, mel_cache_path)
+        print(f"  メルキャッシュを保存しました: {mel_cache_path}")
+
+    y_all = train_master['label_id'].values
+    print(f"y_all shape: {y_all.shape}")
 
 
 # ==============================================================================
@@ -514,93 +569,94 @@ class MelSpectrogramDataset(Dataset):
 
 
 # ==============================================================================
-# Train / Valid 分割
+# Train / Valid 分割（__main__ 内で実行）
 # ==============================================================================
-indices = np.arange(len(X_all))
-train_indices, valid_indices = train_test_split(
-    indices, test_size=TEST_SIZE, random_state=SEED, stratify=y_all
-)
+if __name__ == '__main__':
+    indices = np.arange(len(X_all))
+    train_indices, valid_indices = train_test_split(
+        indices, test_size=TEST_SIZE, random_state=SEED, stratify=y_all
+    )
 
-X_train = X_all[train_indices]
-X_valid = X_all[valid_indices]
-y_train = y_all[train_indices]
-y_valid = y_all[valid_indices]
-train_files_split = [train_files[i] for i in train_indices]
-valid_files_split = [train_files[i] for i in valid_indices]
+    X_train = X_all[train_indices]
+    X_valid = X_all[valid_indices]
+    y_train = y_all[train_indices]
+    y_valid = y_all[valid_indices]
+    train_files_split = [train_files[i] for i in train_indices]
+    valid_files_split = [train_files[i] for i in valid_indices]
 
-print(f"\nX_train: {X_train.shape}, X_valid: {X_valid.shape}")
+    print(f"\nX_train: {X_train.shape}, X_valid: {X_valid.shape}")
 
-# ボーカル積分とジャンル別「ボーカル抜き」適用確率（5:5 になるように）
-vocal_integrals_train = None
-genre_drop_prob = None
-if getattr(config, 'AUGMENT_VOCAL_DROP', False):
-    from collections import defaultdict
-    th = getattr(config, 'VOCAL_INTEGRAL_THRESHOLD', 2500)
-    target_ratio = getattr(config, 'VOCAL_DROP_TARGET_RATIO', 0.5)
-    vocal_integrals_train = []
-    for f in tqdm(train_files_split, desc="  vocal integral (train)"):
-        basename = os.path.splitext(os.path.basename(f))[0]
-        cache_path = os.path.join(SEPARATION_CACHE_DIR, f"{basename}.npz")
-        data = np.load(cache_path)
-        vocal_integrals_train.append(float(np.abs(data['vocals']).sum()))
-    by_label = defaultdict(list)
-    for i in range(len(y_train)):
-        by_label[y_train[i]].append(vocal_integrals_train[i])
-    genre_drop_prob = {}
-    id_to_name = label_master.set_index('label_id')['label_name'].to_dict()
-    print(f"\n  ボーカル抜きオーギュメンテーション内訳 (閾値={th}, 目標割合={target_ratio:.0%})")
-    print(f"  {'ジャンル':<12} {'低(≤th)':>8} {'高(>th)':>8} {'適用確率':>10} {'現在の割合':>10} {'期待割合':>10}")
-    print("  " + "-" * 58)
-    for label_id in range(NUM_CLASSES):
-        vals = by_label.get(label_id, [])
-        L = sum(1 for v in vals if v <= th)
-        H = len(vals) - L
-        n = L + H
-        p = (target_ratio * (H - L) / H) if H > 0 else 0.0
-        genre_drop_prob[label_id] = float(np.clip(p, 0.0, 1.0))
-        curr_ratio = L / n if n else 0
-        # 適用後の期待: 低 = L + p*H, 期待割合 = (L + p*H) / n
-        exp_low = L + genre_drop_prob[label_id] * H
-        exp_ratio = exp_low / n if n else 0
-        name = id_to_name.get(label_id, f"id{label_id}")
-        print(f"  {name:<12} {L:>8} {H:>8} {genre_drop_prob[label_id]:>10.2%} {curr_ratio:>10.1%} {exp_ratio:>10.1%}")
-    print("  " + "-" * 58)
+    # ボーカル積分とジャンル別「ボーカル抜き」適用確率（5:5 になるように）
+    vocal_integrals_train = None
+    genre_drop_prob = None
+    if getattr(config, 'AUGMENT_VOCAL_DROP', False):
+        from collections import defaultdict
+        th = getattr(config, 'VOCAL_INTEGRAL_THRESHOLD', 2500)
+        target_ratio = getattr(config, 'VOCAL_DROP_TARGET_RATIO', 0.5)
+        vocal_integrals_train = []
+        for f in tqdm(train_files_split, desc="  vocal integral (train)"):
+            basename = os.path.splitext(os.path.basename(f))[0]
+            cache_path = os.path.join(SEPARATION_CACHE_DIR, f"{basename}.npz")
+            data = np.load(cache_path)
+            vocal_integrals_train.append(float(np.abs(data['vocals']).sum()))
+        by_label = defaultdict(list)
+        for i in range(len(y_train)):
+            by_label[y_train[i]].append(vocal_integrals_train[i])
+        genre_drop_prob = {}
+        id_to_name = label_master.set_index('label_id')['label_name'].to_dict()
+        print(f"\n  ボーカル抜きオーギュメンテーション内訳 (閾値={th}, 目標割合={target_ratio:.0%})")
+        print(f"  {'ジャンル':<12} {'低(≤th)':>8} {'高(>th)':>8} {'適用確率':>10} {'現在の割合':>10} {'期待割合':>10}")
+        print("  " + "-" * 58)
+        for label_id in range(NUM_CLASSES):
+            vals = by_label.get(label_id, [])
+            L = sum(1 for v in vals if v <= th)
+            H = len(vals) - L
+            n = L + H
+            p = (target_ratio * (H - L) / H) if H > 0 else 0.0
+            genre_drop_prob[label_id] = float(np.clip(p, 0.0, 1.0))
+            curr_ratio = L / n if n else 0
+            # 適用後の期待: 低 = L + p*H, 期待割合 = (L + p*H) / n
+            exp_low = L + genre_drop_prob[label_id] * H
+            exp_ratio = exp_low / n if n else 0
+            name = id_to_name.get(label_id, f"id{label_id}")
+            print(f"  {name:<12} {L:>8} {H:>8} {genre_drop_prob[label_id]:>10.2%} {curr_ratio:>10.1%} {exp_ratio:>10.1%}")
+        print("  " + "-" * 58)
 
-# 正規化パラメータは学習データから計算して共有
-train_dataset = MelSpectrogramDataset(
-    X_train, file_list=train_files_split, y=y_train,
-    augment=True, max_frames=max_frames_train,
-    vocal_integrals=vocal_integrals_train, genre_drop_prob=genre_drop_prob
-)
-valid_dataset = MelSpectrogramDataset(
-    X_valid, file_list=valid_files_split, y=y_valid,
-    augment=False, max_frames=max_frames_train
-)
-valid_dataset.ch_means = train_dataset.ch_means
-valid_dataset.ch_stds = train_dataset.ch_stds
+    # 正規化パラメータは学習データから計算して共有
+    train_dataset = MelSpectrogramDataset(
+        X_train, file_list=train_files_split, y=y_train,
+        augment=True, max_frames=max_frames_train,
+        vocal_integrals=vocal_integrals_train, genre_drop_prob=genre_drop_prob
+    )
+    valid_dataset = MelSpectrogramDataset(
+        X_valid, file_list=valid_files_split, y=y_valid,
+        augment=False, max_frames=max_frames_train
+    )
+    valid_dataset.ch_means = train_dataset.ch_means
+    valid_dataset.ch_stds = train_dataset.ch_stds
 
-test_dataset = MelSpectrogramDataset(
-    X_test_raw, file_list=test_files, y=None,
-    augment=False, max_frames=max_frames_train
-)
-test_dataset.ch_means = train_dataset.ch_means
-test_dataset.ch_stds = train_dataset.ch_stds
+    test_dataset = MelSpectrogramDataset(
+        X_test_raw, file_list=test_files, y=None,
+        augment=False, max_frames=max_frames_train
+    )
+    test_dataset.ch_means = train_dataset.ch_means
+    test_dataset.ch_stds = train_dataset.ch_stds
 
-train_loader = DataLoader(
-    train_dataset, batch_size=BATCH_SIZE, shuffle=True,
-    num_workers=0, pin_memory=True if torch.cuda.is_available() else False
-)
-valid_loader = DataLoader(
-    valid_dataset, batch_size=BATCH_SIZE, shuffle=False,
-    num_workers=0, pin_memory=True if torch.cuda.is_available() else False
-)
-test_loader = DataLoader(
-    test_dataset, batch_size=BATCH_SIZE, shuffle=False,
-    num_workers=0, pin_memory=True if torch.cuda.is_available() else False
-)
+    train_loader = DataLoader(
+        train_dataset, batch_size=BATCH_SIZE, shuffle=True,
+        num_workers=12, persistent_workers=True, pin_memory=True if torch.cuda.is_available() else False
+    )
+    valid_loader = DataLoader(
+        valid_dataset, batch_size=BATCH_SIZE, shuffle=False,
+        num_workers=12, persistent_workers=True, pin_memory=True if torch.cuda.is_available() else False
+    )
+    test_loader = DataLoader(
+        test_dataset, batch_size=BATCH_SIZE, shuffle=False,
+        num_workers=12, persistent_workers=True, pin_memory=True if torch.cuda.is_available() else False
+    )
 
 # ==============================================================================
-# モデル定義: EfficientNet B3
+# モデル定義: EfficientNet B3（モジュールレベルで定義、ワーカーから利用）
 # ==============================================================================
 def build_model(num_classes=NUM_CLASSES):
     """事前学習済み EfficientNet B3 を Fine-tuning 用に構築
@@ -629,19 +685,20 @@ def build_model(num_classes=NUM_CLASSES):
     return model
 
 
-model = build_model().to(DEVICE)
-print(f"\nモデルパラメータ数: {sum(p.numel() for p in model.parameters()):,}")
-print(f"学習可能パラメータ数: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
+if __name__ == '__main__':
+    model = build_model().to(DEVICE)
+    print(f"\nモデルパラメータ数: {sum(p.numel() for p in model.parameters()):,}")
+    print(f"学習可能パラメータ数: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
 
-# ==============================================================================
-# 損失関数・最適化・スケジューラ
-# ==============================================================================
-criterion = nn.CrossEntropyLoss()
-optimizer = optim.AdamW(
-    filter(lambda p: p.requires_grad, model.parameters()),
-    lr=LR, weight_decay=WEIGHT_DECAY
-)
-scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS, eta_min=1e-6)
+    # ==============================================================================
+    # 損失関数・最適化・スケジューラ
+    # ==============================================================================
+    criterion = nn.CrossEntropyLoss()
+    optimizer = optim.AdamW(
+        filter(lambda p: p.requires_grad, model.parameters()),
+        lr=LR, weight_decay=WEIGHT_DECAY
+    )
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS, eta_min=1e-6)
 
 # ==============================================================================
 # 学習・評価ループ
@@ -770,131 +827,134 @@ def signal_handler(sig, frame):
 signal.signal(signal.SIGINT, signal_handler)
 signal.signal(signal.SIGTERM, signal_handler)
 
-# ==============================================================================
-# 学習実行
-# ==============================================================================
-print("\n=== 学習開始 ===")
+# 学習実行（同上の if __name__ ブロック内で実行するため、ここで続ける）
+if __name__ == '__main__':
+    # ==============================================================================
+    # 学習実行
+    # ==============================================================================
+    print("\n=== 学習開始 ===")
 
-if RESUME_FROM_CHECKPOINT:
-    start_epoch, best_valid_acc, best_epoch, patience_counter = load_checkpoint(
-        model, optimizer, scheduler,
-        load_optimizer=LOAD_OPTIMIZER_STATE,
-        load_scheduler=LOAD_SCHEDULER_STATE
-    )
-else:
-    print("チェックポイントの読み込みをスキップします（最初から学習）")
-    start_epoch, best_valid_acc, best_epoch, patience_counter = 1, 0, 0, 0
+    if RESUME_FROM_CHECKPOINT:
+        start_epoch, best_valid_acc, best_epoch, patience_counter = load_checkpoint(
+            model, optimizer, scheduler,
+            load_optimizer=LOAD_OPTIMIZER_STATE,
+            load_scheduler=LOAD_SCHEDULER_STATE
+        )
+    else:
+        print("チェックポイントの読み込みをスキップします（最初から学習）")
+        start_epoch, best_valid_acc, best_epoch, patience_counter = 1, 0, 0, 0
 
-patience = PATIENCE
+    patience = PATIENCE
 
-current_epoch = start_epoch
+    current_epoch = start_epoch
 
-print(f"学習設定:")
-print(f"  開始エポック: {start_epoch}")
-print(f"  最大エポック: {EPOCHS}")
-print(f"  バッチサイズ: {BATCH_SIZE}")
-print(f"  学習データ数: {len(train_dataset)}")
-print(f"  検証データ数: {len(valid_dataset)}")
-print(f"  入力チャンネル: 3ch (原音 / 伴奏 / ボーカル)")
-print(f"  デバイス: {DEVICE}")
+    print(f"学習設定:")
+    print(f"  開始エポック: {start_epoch}")
+    print(f"  最大エポック: {EPOCHS}")
+    print(f"  バッチサイズ: {BATCH_SIZE}")
+    print(f"  学習データ数: {len(train_dataset)}")
+    print(f"  検証データ数: {len(valid_dataset)}")
+    print(f"  入力チャンネル: 3ch (原音 / 伴奏 / ボーカル)")
+    print(f"  デバイス: {DEVICE}")
 
-try:
-    for epoch in range(start_epoch, EPOCHS + 1):
-        current_epoch = epoch
+    try:
+        for epoch in range(start_epoch, EPOCHS + 1):
+            current_epoch = epoch
 
-        if interrupted:
-            print("\n学習を中断します...")
-            save_checkpoint(epoch - 1, model, optimizer, scheduler, best_valid_acc, best_epoch, patience_counter)
-            break
+            if interrupted:
+                print("\n学習を中断します...")
+                save_checkpoint(epoch - 1, model, optimizer, scheduler, best_valid_acc, best_epoch, patience_counter)
+                break
 
-        print(f"Epoch {epoch} の学習を開始...")
-        train_loss, train_acc = train_one_epoch(model, train_loader, criterion, optimizer)
-        print(f"Epoch {epoch} の評価を開始...")
-        valid_loss, valid_acc = evaluate(model, valid_loader, criterion)
-        scheduler.step()
+            print(f"Epoch {epoch} の学習を開始...")
+            train_loss, train_acc = train_one_epoch(model, train_loader, criterion, optimizer)
+            print(f"Epoch {epoch} の評価を開始...")
+            valid_loss, valid_acc = evaluate(model, valid_loader, criterion)
+            scheduler.step()
 
-        lr = optimizer.param_groups[0]['lr']
-        print(f"Epoch {epoch:3d}/{EPOCHS} | "
-              f"Train Loss: {train_loss:.4f} Acc: {train_acc:.4f} | "
-              f"Valid Loss: {valid_loss:.4f} Acc: {valid_acc:.4f} | "
-              f"LR: {lr:.6f}")
+            lr = optimizer.param_groups[0]['lr']
+            print(f"Epoch {epoch:3d}/{EPOCHS} | "
+                  f"Train Loss: {train_loss:.4f} Acc: {train_acc:.4f} | "
+                  f"Valid Loss: {valid_loss:.4f} Acc: {valid_acc:.4f} | "
+                  f"LR: {lr:.6f}")
 
-        if valid_acc >= best_valid_acc:
-            best_valid_acc = valid_acc
-            best_epoch = epoch
-            patience_counter = 0
-            torch.save(model.state_dict(), BEST_MODEL_FILE)
-            save_checkpoint(epoch, model, optimizer, scheduler, best_valid_acc, best_epoch, patience_counter)
-            print(f"  → ベストモデル更新 (Valid Acc: {best_valid_acc:.4f})")
-        else:
-            patience_counter += 1
+            if valid_acc >= best_valid_acc:
+                best_valid_acc = valid_acc
+                best_epoch = epoch
+                patience_counter = 0
+                torch.save(model.state_dict(), BEST_MODEL_FILE)
+                save_checkpoint(epoch, model, optimizer, scheduler, best_valid_acc, best_epoch, patience_counter)
+                print(f"  → ベストモデル更新 (Valid Acc: {best_valid_acc:.4f})")
+            else:
+                patience_counter += 1
 
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+            if patience_counter >= patience:
+                print(f"\nEarly Stopping at epoch {epoch} (ベスト: epoch {best_epoch})")
+                break
+
+        print(f"\n=== 学習完了 ===")
+        print(f"ベストモデル: epoch {best_epoch}, Valid Acc: {best_valid_acc:.4f}")
+
+    except KeyboardInterrupt:
+        print("\n\nCtrl+Cで中断されました。チェックポイントを保存します...")
+        save_checkpoint(current_epoch - 1, model, optimizer, scheduler, best_valid_acc, best_epoch, patience_counter)
+        print("チェックポイント保存完了。次回は同じスクリプトで再開できます。")
+    except Exception as e:
+        print(f"\n\nエラーが発生しました: {type(e).__name__}")
+        print(f"エラーメッセージ: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        print("\nチェックポイントを保存します...")
+        if current_epoch > start_epoch:
+            save_checkpoint(current_epoch - 1, model, optimizer, scheduler, best_valid_acc, best_epoch, patience_counter)
+        sys.exit(1)
+
+    finally:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+            print("GPUメモリをクリアしました。")
 
-        if patience_counter >= patience:
-            print(f"\nEarly Stopping at epoch {epoch} (ベスト: epoch {best_epoch})")
-            break
+    # ==============================================================================
+    # テストデータの推論・提出ファイル作成
+    # ==============================================================================
+    print("\n=== テストデータ推論 ===")
+    if os.path.exists(BEST_MODEL_FILE):
+        model.load_state_dict(torch.load(BEST_MODEL_FILE, map_location=DEVICE))
+        print(f"ベストモデルを読み込み: {BEST_MODEL_FILE}")
+    else:
+        print(f"警告: {BEST_MODEL_FILE} が見つかりません。チェックポイントから読み込みます。")
+        if os.path.exists(CHECKPOINT_FILE):
+            checkpoint = torch.load(CHECKPOINT_FILE, map_location=DEVICE)
+            model.load_state_dict(checkpoint['model_state_dict'])
+            print(f"チェックポイントから読み込み: {CHECKPOINT_FILE}")
+        else:
+            print("エラー: モデルファイルが見つかりません。")
+            sys.exit(1)
+    model.eval()
 
-    print(f"\n=== 学習完了 ===")
-    print(f"ベストモデル: epoch {best_epoch}, Valid Acc: {best_valid_acc:.4f}")
+    all_preds = []
+    with torch.no_grad():
+        for X_batch in test_loader:
+            X_batch = X_batch.to(DEVICE, non_blocking=True)
+            outputs = model(X_batch)
+            preds = outputs.argmax(dim=1).cpu().numpy()
+            all_preds.extend(preds)
 
-except KeyboardInterrupt:
-    print("\n\nCtrl+Cで中断されました。チェックポイントを保存します...")
-    save_checkpoint(current_epoch - 1, model, optimizer, scheduler, best_valid_acc, best_epoch, patience_counter)
-    print("チェックポイント保存完了。次回は同じスクリプトで再開できます。")
-except Exception as e:
-    print(f"\n\nエラーが発生しました: {type(e).__name__}")
-    print(f"エラーメッセージ: {str(e)}")
-    import traceback
-    traceback.print_exc()
-    print("\nチェックポイントを保存します...")
-    if current_epoch > start_epoch:
-        save_checkpoint(current_epoch - 1, model, optimizer, scheduler, best_valid_acc, best_epoch, patience_counter)
-    sys.exit(1)
+            del outputs, X_batch
 
-finally:
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
-        print("GPUメモリをクリアしました。")
 
-# ==============================================================================
-# テストデータの推論・提出ファイル作成
-# ==============================================================================
-print("\n=== テストデータ推論 ===")
-if os.path.exists(BEST_MODEL_FILE):
-    model.load_state_dict(torch.load(BEST_MODEL_FILE, map_location=DEVICE))
-    print(f"ベストモデルを読み込み: {BEST_MODEL_FILE}")
-else:
-    print(f"警告: {BEST_MODEL_FILE} が見つかりません。チェックポイントから読み込みます。")
-    if os.path.exists(CHECKPOINT_FILE):
-        checkpoint = torch.load(CHECKPOINT_FILE, map_location=DEVICE)
-        model.load_state_dict(checkpoint['model_state_dict'])
-        print(f"チェックポイントから読み込み: {CHECKPOINT_FILE}")
-    else:
-        print("エラー: モデルファイルが見つかりません。")
-        sys.exit(1)
-model.eval()
+    # 提出CSV作成
+    test_file_names = [os.path.basename(f) for f in test_files]
+    submit_df = pd.DataFrame({
+        0: test_file_names,
+        1: all_preds
+    })
+    submit_df.to_csv(SUBMIT_FILE, index=False, header=False)
+    print(f"提出ファイル作成完了: {SUBMIT_FILE} ({len(submit_df)} 件)")
+    print(submit_df.head(10))
 
-all_preds = []
-with torch.no_grad():
-    for X_batch in test_loader:
-        X_batch = X_batch.to(DEVICE, non_blocking=True)
-        outputs = model(X_batch)
-        preds = outputs.argmax(dim=1).cpu().numpy()
-        all_preds.extend(preds)
-
-        del outputs, X_batch
-
-if torch.cuda.is_available():
-    torch.cuda.empty_cache()
-
-# 提出CSV作成
-test_file_names = [os.path.basename(f) for f in test_files]
-submit_df = pd.DataFrame({
-    0: test_file_names,
-    1: all_preds
-})
-submit_df.to_csv(SUBMIT_FILE, index=False, header=False)
-print(f"提出ファイル作成完了: {SUBMIT_FILE} ({len(submit_df)} 件)")
-print(submit_df.head(10))
