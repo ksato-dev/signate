@@ -60,11 +60,54 @@ if torch.cuda.is_available():
 print(f"Device: {DEVICE}")
 
 # ==============================================================================
-# 音源分離（Demucs）
+# 4ステム名 / キャッシュ判定 / 3ch 変換ヘルパー
+# ==============================================================================
+STEM_NAMES_4 = ['vocals', 'drums', 'bass', 'other']
+
+
+def _is_4stem_cache(cache_path):
+    """キャッシュが4ステム形式かどうかを判定"""
+    if not os.path.exists(cache_path):
+        return False
+    try:
+        data = np.load(cache_path)
+        result = 'drums' in data
+        data.close()
+        return result
+    except Exception:
+        return False
+
+
+def load_3ch_from_cache(data):
+    """任意のキャッシュ形式 (3ch or 4stem) から (original, accompaniment, vocals) を返す
+
+    4stem (vocals, drums, bass, other; optional original):
+        original = data['original'] があればそれ、なければ全ステムの和
+        accompaniment = drums + bass + other
+    3ch (original, accompaniment, vocals):
+        そのまま返す
+    """
+    if 'drums' in data:
+        vocals = data['vocals']
+        drums = data['drums']
+        bass = data['bass']
+        other = data['other']
+        accompaniment = drums + bass + other
+        original = data['original'] if 'original' in data else (vocals + accompaniment)
+        return original, accompaniment, vocals
+    else:
+        return data['original'], data['accompaniment'], data['vocals']
+
+
+# ==============================================================================
+# 音源分離（Demucs）4ステム
 # ==============================================================================
 def separate_audio_cached(file_path, demucs_model, cache_dir=SEPARATION_CACHE_DIR, sr=SR,
                           device=DEVICE):
-    """音声ファイルをDemucsで分離し、原音・伴奏・ボーカルの波形を返す（キャッシュ付き）
+    """音声ファイルをDemucsで4ステム（vocals/drums/bass/other）に分離しキャッシュする
+
+    旧3chキャッシュ（original/accompaniment/vocals）が見つかった場合は
+    自動で再分離して4ステム形式に変換する。
 
     Args:
         file_path: 音声ファイルパス
@@ -74,19 +117,23 @@ def separate_audio_cached(file_path, demucs_model, cache_dir=SEPARATION_CACHE_DI
         device: 推論デバイス
 
     Returns:
-        original: 原音波形 (numpy array)
-        accompaniment: 伴奏波形 (numpy array)
-        vocals: ボーカル波形 (numpy array)
+        tuple: (vocals, drums, bass, other) の各波形 (numpy array)
     """
     from demucs.apply import apply_model
 
     basename = os.path.splitext(os.path.basename(file_path))[0]
     cache_path = os.path.join(cache_dir, f"{basename}.npz")
 
-    # キャッシュが存在すればロード
+    # 4ステムキャッシュが存在すればロード
     if os.path.exists(cache_path):
         data = np.load(cache_path)
-        return data['original'], data['accompaniment'], data['vocals']
+        if 'drums' in data:
+            stems = tuple(data[n] for n in STEM_NAMES_4)
+            data.close()
+            return stems
+        data.close()
+        print(f"  旧3chキャッシュを検出: {basename} → 4stem で再分離します")
+        os.remove(cache_path)
 
     os.makedirs(cache_dir, exist_ok=True)
 
@@ -98,65 +145,48 @@ def separate_audio_cached(file_path, demucs_model, cache_dir=SEPARATION_CACHE_DI
     y_demucs, _ = librosa.load(file_path, sr=demucs_sr, mono=True)
 
     # Demucsはステレオ入力を想定 → モノラルを疑似ステレオに
-    # apply_model は (batch, channels, time) を期待
     waveform = torch.FloatTensor(y_demucs).unsqueeze(0).repeat(2, 1)  # (2, time)
     mix = waveform.unsqueeze(0)  # (1, 2, time)
 
     with torch.no_grad():
-        # sources: (1, n_sources, 2, time)  sources順 = model.sources
         sources = apply_model(demucs_model, mix, device=device)
 
     sources = sources.squeeze(0)  # (n_sources, 2, time)
     source_names = demucs_model.sources  # ['drums', 'bass', 'other', 'vocals']
 
-    # ボーカルを抽出（ステレオ→モノラル）
-    vocals_idx = source_names.index("vocals")
-    vocals_raw = sources[vocals_idx].mean(dim=0).cpu().numpy()  # (time,)
+    # 各ステムを抽出（ステレオ→モノラル）してリサンプル
+    stems = {}
+    for name in STEM_NAMES_4:
+        idx = source_names.index(name)
+        raw = sources[idx].mean(dim=0).cpu().numpy()
+        stems[name] = librosa.resample(raw, orig_sr=demucs_sr, target_sr=sr) if demucs_sr != sr else raw
 
-    # 伴奏 = ボーカル以外のステムの合計
-    acc_indices = [i for i, name in enumerate(source_names) if name != "vocals"]
-    accompaniment_raw = sources[acc_indices].sum(dim=0).mean(dim=0).cpu().numpy()  # (time,)
-
-    # Demucsのサンプリングレートから目標サンプリングレートにリサンプル
-    if demucs_sr != sr:
-        vocals = librosa.resample(vocals_raw, orig_sr=demucs_sr, target_sr=sr)
-        accompaniment = librosa.resample(accompaniment_raw, orig_sr=demucs_sr, target_sr=sr)
-    else:
-        vocals = vocals_raw
-        accompaniment = accompaniment_raw
-
-    # 長さを揃える
-    min_len = min(len(original), len(vocals), len(accompaniment))
+    # 長さを揃える（原音含む）
+    min_len = min(len(original), *(len(v) for v in stems.values()))
     original = original[:min_len]
-    vocals = vocals[:min_len]
-    accompaniment = accompaniment[:min_len]
+    for name in stems:
+        stems[name] = stems[name][:min_len]
 
-    # キャッシュ保存
-    np.savez_compressed(cache_path,
-                        original=original,
-                        accompaniment=accompaniment,
-                        vocals=vocals)
+    # 4ステム + original（元の音声ファイル）でキャッシュ保存
+    np.savez_compressed(cache_path, original=original, **stems)
 
-    return original, accompaniment, vocals
+    return tuple(stems[n] for n in STEM_NAMES_4)
 
 
 def batch_separate(file_list, demucs_model, cache_dir=SEPARATION_CACHE_DIR, sr=SR,
                    device=DEVICE):
-    """ファイルリスト全体を分離（プログレスバー付き）"""
-    cached = sum(
+    """ファイルリスト全体を4ステム分離（旧3chキャッシュも自動で再分離）"""
+    cached_4stem = sum(
         1 for f in file_list
-        if os.path.exists(
+        if _is_4stem_cache(
             os.path.join(cache_dir,
                          f"{os.path.splitext(os.path.basename(f))[0]}.npz"))
     )
-
-    if cached == len(file_list):
-        print(f"  全{len(file_list)}ファイルがキャッシュ済み")
+    if cached_4stem == len(file_list):
+        print(f"  全{len(file_list)}ファイルが4ステムキャッシュ済み")
         return
-
-    print(f"  キャッシュ済み: {cached}/{len(file_list)}, "
-          f"残り{len(file_list) - cached}ファイルを分離中...")
-
+    print(f"  4ステムキャッシュ済み: {cached_4stem}/{len(file_list)}, "
+          f"残り{len(file_list) - cached_4stem}ファイルを分離中...")
     for f in tqdm(file_list, desc="  音源分離"):
         separate_audio_cached(f, demucs_model, cache_dir, sr, device)
 
@@ -263,9 +293,7 @@ def load_and_pad_3ch(file_list, cache_dir=SEPARATION_CACHE_DIR, sr=SR, n_mels=N_
         cache_path = os.path.join(cache_dir, f"{basename}.npz")
         data = np.load(cache_path)
 
-        original = data['original']
-        accompaniment = data['accompaniment']
-        vocals = data['vocals']
+        original, accompaniment, vocals = load_3ch_from_cache(data)
 
         mel_orig = extract_melspectrogram(original, sr=sr, n_mels=n_mels)
         mel_acc = extract_melspectrogram(accompaniment, sr=sr, n_mels=n_mels)
@@ -369,7 +397,7 @@ class MelSpectrogramDataset(Dataset):
 
     def __init__(self, X, file_list=None, y=None, img_size=IMG_SIZE,
                  augment=False, sr=SR, n_mels=N_MELS, max_frames=None,
-                 cache_dir=SEPARATION_CACHE_DIR):
+                 cache_dir=SEPARATION_CACHE_DIR, vocal_integrals=None, genre_drop_prob=None):
         self.X = X  # (N, 3, n_mels, time_frames)
         self.file_list = file_list
         self.y = y
@@ -379,6 +407,8 @@ class MelSpectrogramDataset(Dataset):
         self.n_mels = n_mels
         self.max_frames = max_frames
         self.cache_dir = cache_dir
+        self.vocal_integrals = vocal_integrals  # 訓練用: サンプルごとのボーカル積分
+        self.genre_drop_prob = genre_drop_prob  # ジャンルごとのボーカル抜き適用確率
 
         # 正規化パラメータ（チャンネルごとに計算）
         self.ch_means = np.array([X[:, ch].mean() for ch in range(3)])  # (3,)
@@ -395,9 +425,20 @@ class MelSpectrogramDataset(Dataset):
             cache_path = os.path.join(self.cache_dir, f"{basename}.npz")
             data = np.load(cache_path)
 
-            original = data['original'].copy()
-            accompaniment = data['accompaniment'].copy()
-            vocals = data['vocals'].copy()
+            original, accompaniment, vocals = load_3ch_from_cache(data)
+            original = original.copy()
+            accompaniment = accompaniment.copy()
+            vocals = vocals.copy()
+
+            # ボーカル抜きオーギュメンテーション: 積分>閾値のサンプルをジャンル別確率で伴奏のみに
+            if (self.vocal_integrals is not None and self.genre_drop_prob is not None
+                    and self.y is not None):
+                th = getattr(config, 'VOCAL_INTEGRAL_THRESHOLD', 2500)
+                label_id = int(self.y[idx])
+                p = self.genre_drop_prob.get(label_id, 0.0)
+                if self.vocal_integrals[idx] > th and p > 0 and np.random.random() < p:
+                    vocals = np.zeros_like(vocals)
+                    original = accompaniment.copy()
 
             # 同一パラメータで3チャンネルすべてをオーギュメント
             aug_params = generate_augment_params(sr=self.sr)
@@ -489,10 +530,47 @@ valid_files_split = [train_files[i] for i in valid_indices]
 
 print(f"\nX_train: {X_train.shape}, X_valid: {X_valid.shape}")
 
+# ボーカル積分とジャンル別「ボーカル抜き」適用確率（5:5 になるように）
+vocal_integrals_train = None
+genre_drop_prob = None
+if getattr(config, 'AUGMENT_VOCAL_DROP', False):
+    from collections import defaultdict
+    th = getattr(config, 'VOCAL_INTEGRAL_THRESHOLD', 2500)
+    target_ratio = getattr(config, 'VOCAL_DROP_TARGET_RATIO', 0.5)
+    vocal_integrals_train = []
+    for f in tqdm(train_files_split, desc="  vocal integral (train)"):
+        basename = os.path.splitext(os.path.basename(f))[0]
+        cache_path = os.path.join(SEPARATION_CACHE_DIR, f"{basename}.npz")
+        data = np.load(cache_path)
+        vocal_integrals_train.append(float(np.abs(data['vocals']).sum()))
+    by_label = defaultdict(list)
+    for i in range(len(y_train)):
+        by_label[y_train[i]].append(vocal_integrals_train[i])
+    genre_drop_prob = {}
+    id_to_name = label_master.set_index('label_id')['label_name'].to_dict()
+    print(f"\n  ボーカル抜きオーギュメンテーション内訳 (閾値={th}, 目標割合={target_ratio:.0%})")
+    print(f"  {'ジャンル':<12} {'低(≤th)':>8} {'高(>th)':>8} {'適用確率':>10} {'現在の割合':>10} {'期待割合':>10}")
+    print("  " + "-" * 58)
+    for label_id in range(NUM_CLASSES):
+        vals = by_label.get(label_id, [])
+        L = sum(1 for v in vals if v <= th)
+        H = len(vals) - L
+        n = L + H
+        p = (target_ratio * (H - L) / H) if H > 0 else 0.0
+        genre_drop_prob[label_id] = float(np.clip(p, 0.0, 1.0))
+        curr_ratio = L / n if n else 0
+        # 適用後の期待: 低 = L + p*H, 期待割合 = (L + p*H) / n
+        exp_low = L + genre_drop_prob[label_id] * H
+        exp_ratio = exp_low / n if n else 0
+        name = id_to_name.get(label_id, f"id{label_id}")
+        print(f"  {name:<12} {L:>8} {H:>8} {genre_drop_prob[label_id]:>10.2%} {curr_ratio:>10.1%} {exp_ratio:>10.1%}")
+    print("  " + "-" * 58)
+
 # 正規化パラメータは学習データから計算して共有
 train_dataset = MelSpectrogramDataset(
     X_train, file_list=train_files_split, y=y_train,
-    augment=True, max_frames=max_frames_train
+    augment=True, max_frames=max_frames_train,
+    vocal_integrals=vocal_integrals_train, genre_drop_prob=genre_drop_prob
 )
 valid_dataset = MelSpectrogramDataset(
     X_valid, file_list=valid_files_split, y=y_valid,
@@ -741,7 +819,7 @@ try:
               f"Valid Loss: {valid_loss:.4f} Acc: {valid_acc:.4f} | "
               f"LR: {lr:.6f}")
 
-        if valid_acc > best_valid_acc:
+        if valid_acc >= best_valid_acc:
             best_valid_acc = valid_acc
             best_epoch = epoch
             patience_counter = 0
