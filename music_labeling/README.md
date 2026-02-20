@@ -1,21 +1,21 @@
 # 音楽ジャンル分類 - EfficientNet B3
 
 音楽音声ファイルを10種類のジャンルに分類する深層学習モデルです。
-Demucs で音源を4ステム分離し、4チャンネルメルスペクトログラムを EfficientNet B3 で Fine-tuning します。
+Demucs で音源を分離し、3チャンネルメルスペクトログラム（原音 / 伴奏 / ボーカル）を EfficientNet B3 で Fine-tuning します。
 
 ## プロジェクト概要
 
 - **タスク**: 音楽ジャンル分類（10クラス）
 - **モデル**: EfficientNet B3 (ImageNet事前学習済み)
-- **音源分離**: Demucs (htdemucs) — 4ステム分離
+- **音源分離**: Demucs (htdemucs) — 4ステム分離 → 3チャンネルに変換
 - **フレームワーク**: PyTorch
-- **入力**: 4チャンネルメルスペクトログラム（Vocals / Drums / Bass / Other → 600x600にリサイズ）
+- **入力**: 3チャンネルメルスペクトログラム（Original / Accompaniment / Vocals → 600x600にリサイズ）
 - **出力**: 10クラス分類（blues, classical, country, disco, hiphop, jazz, metal, pop, reggae, rock）
 
 ## モデルアーキテクチャ
 
 ```
-Input: (B, 4, H, W)   ← 4ch メルスペクトログラム（vocals / drums / bass / other）
+Input: (B, 3, H, W)   ← 3ch メルスペクトログラム（original / accompaniment / vocals）
         ↓
 EfficientNet B3（features[:6] 凍結）
         ↓
@@ -25,48 +25,55 @@ Classifier:
 Output logits
 ```
 
-### 4チャンネル入力の初期化
-
-EfficientNet B3 は ImageNet で3チャンネル（RGB）入力として事前学習されています。
-4チャンネル入力に対応するため、最初の Conv 層を以下のように拡張しています。
-
-```
-新Conv.weight[:, :3] = 旧Conv.weight     ← ImageNet 事前学習済みの重みをそのまま使用
-新Conv.weight[:, 3]  = 旧Conv.weight の3ch平均  ← 4ch 目は既存3ch の平均で初期化
-```
+3チャンネル入力は EfficientNet B3 の標準 RGB 入力とそのまま一致するため、Conv 層の改変は不要です。
 
 ### 設計ポイント
 
 | 要素 | 内容 |
 |---|---|
 | EfficientNet B3 | ImageNet 事前学習済みの CNN。`features[:6]` を凍結して過学習を防止 |
-| 4stem 入力 | Vocals / Drums / Bass / Other を個別チャンネルとして入力。楽器ごとの特徴を保持 |
+| 3ch 入力 | Original / Accompaniment / Vocals を個別チャンネルとして入力 |
 | カスタム分類ヘッド | Dropout + Linear(1536→512) + ReLU + Dropout + Linear(512→10) |
 | Mixed Precision (AMP) | float16 で計算し VRAM 使用量を約40-50%削減 |
 
-## 特徴
-
-- **4ステム音源分離 (Demucs)**: Vocals / Drums / Bass / Other に分離し、4チャンネル入力として楽器ごとの情報を保持
-- **Mixed Precision Training (AMP)**: VRAM 使用量を大幅に削減
-- **強力なデータオーギュメンテーション**:
-  - Pitch Shifting（ピッチシフト）
-  - Time Stretching（タイムストレッチ）
-  - Adding Noise（ノイズ追加）
-  - Time Shifting（タイムシフト）
-  - SpecAugment（Time/Frequency Masking）
-- **チェックポイント機能**: 学習の中断・再開に対応
-- **ログ出力**: コンソールとファイル（`train_log.txt`）への同時出力
-- **メモリ効率**: Demucs 分離結果のキャッシュ、GPU メモリリーク対策
-
 ## 処理フロー
 
-1. **音源分離**: Demucs で4ステム（vocals / drums / bass / other）に分離（キャッシュ付き）
-2. **メルスペクトログラム抽出**: 4チャンネル (128 x time_frames) を生成
-3. **前処理**: パディング、チャンネルごと標準化、リサイズ (600x600)
-4. **Train/Valid 分割**: 10%を検証データとして分割
-5. **学習**: features[:6] 凍結で分類ヘッドを学習（CosineAnnealing + Early Stopping）
-6. **推論**: テストデータで予測
-7. **提出ファイル生成**: `submit.csv` を出力
+```
+1. 音源分離 (Demucs 4stem → 3ch: original / accompaniment / vocals)
+        ↓
+2. メルスペクトログラム抽出 (128 mel bands)
+        ↓
+3. 前処理 (パディング → チャンネルごと標準化 → 600x600 リサイズ)
+        ↓
+4. K-Fold 交差検証 (StratifiedKFold, N_FOLDS=5)
+   ├── Fold ごとにモデル学習 + Early Stopping
+   └── CV スコアサマリー表示
+        ↓  ← Ctrl+C で中止可能 (20秒待機)
+5. 全データで最終モデルを再学習 (CV 平均ベストエポック数)
+        ↓
+6. テスト推論 → submit.csv 出力
+```
+
+`N_FOLDS = 0` に設定すると CV をスキップし、全データで直接学習します。
+
+## 外部データ: MagnaTagATune
+
+MagnaTagATune データセットの音声ファイルを、ジャンルタグに基づいて学習データに追加できます。
+
+- `annotations_final.csv` の 10 ジャンルカラムを `label_master.csv` と照合
+- 複数ジャンルタグを持つクリップは最も件数が少ないジャンルに優先割り当て
+- クラスごとに均等サンプリング（デフォルト 50 件/クラス = 500 件追加）
+- `USE_MAGNA_DATA = False` で無効化可能
+- サンプリング結果は `data/magna_sampled.csv` に出力
+
+## 外部データ: GTZAN
+
+GTZAN Dataset (`genres_original`) の音声ファイルを学習データに追加できます。
+
+- 10ジャンル × 100ファイル = 1000件（完全均等バランス）
+- フォルダ名が `label_master.csv` のジャンル名と完全一致するため全件そのまま使用
+- `USE_GTZAN_DATA = False` で無効化可能
+- プロファイルは `data/gtzan_profile.csv` に出力
 
 ## ディレクトリ構造
 
@@ -75,18 +82,25 @@ music_labeling/
 ├── train.py                  # メイン学習スクリプト
 ├── config.py                 # 設定ファイル（ハイパーパラメータ管理）
 ├── export_separated_wav.py   # 音源分離キャッシュ → WAV 変換ツール
-├── eda.py                    # 探索的データ分析
-├── requirements.txt          # 依存パッケージ
 ├── README.md                 # このファイル
 ├── data/
 │   ├── train_master.csv      # 学習データのメタデータ
 │   ├── label_master.csv      # ラベル定義
 │   ├── sample_submit.csv     # 提出フォーマット例
 │   ├── separated/            # 音源分離キャッシュ（自動生成, 4stem .npz）
+│   ├── precomputed_mel.npz   # メルスペクトログラムキャッシュ（自動生成）
+│   ├── augmentation_profile.csv  # オーギュメンテーション設定プロファイル（自動生成）
+│   ├── magna_sampled.csv     # MagnaTagATune サンプリング結果（自動生成）
+│   ├── gtzan_profile.csv     # GTZAN 使用ファイル一覧（自動生成）
+│   ├── GTZAN_Dataset/Data/genres_original/  # GTZAN データセット（10ジャンル×100件）
+│   ├── TheMagnaTagATuneDataset/  # MagnaTagATune データセット
+│   │   ├── annotations_final.csv
+│   │   ├── clip_info_final.csv
+│   │   └── 001/, 002/, 003/  # 音声ファイル (.mp3)
 │   ├── train_sound_*/        # 学習音声ファイル
 │   └── test_sound_*/         # テスト音声ファイル
-├── checkpoint.pth            # 学習チェックポイント（自動生成）
-├── best_model.pth            # ベストモデル（自動生成）
+├── checkpoint_fold{N}.pth    # 学習チェックポイント（Fold ごと、自動生成）
+├── best_model_fold{N}.pth    # ベストモデル（Fold ごと、自動生成）
 ├── train_log.txt             # 学習ログ（自動生成）
 └── submit.csv                # 提出ファイル（自動生成）
 ```
@@ -110,12 +124,6 @@ source venv/bin/activate
 # CUDA 12.1 の場合:
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
 
-# CUDA 11.8 の場合:
-pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
-
-# CPU版の場合:
-pip install torch torchvision
-
 # その他の依存パッケージ
 pip install -r requirements.txt
 ```
@@ -129,14 +137,31 @@ cd music_labeling
 python train.py
 ```
 
-学習ログは `train_log.txt` にも自動的に出力されます。
+### CV + 全データ再学習（デフォルト）
+
+`N_FOLDS = 5` の場合:
+
+1. 5-Fold CV でスコアを計測
+2. CV サマリー表示後、20秒待機（Ctrl+C で再学習をスキップ可能）
+3. 全データで最終モデルを学習（CV の平均ベストエポック数）
+4. テスト推論 → `submit.csv` 出力
+
+### CV なし・全データ学習
+
+`config.py` で `N_FOLDS = 0` に設定:
+
+```python
+N_FOLDS = 0  # CV スキップ、全データで直接学習
+```
+
+全データで `EPOCHS` 回学習し、そのまま推論します。
 
 ### 学習の再開
 
-学習が中断された場合、`config.py` で `RESUME_FROM_CHECKPOINT = True` に設定して再実行します。
+`config.py` で `RESUME_FROM_CHECKPOINT = True` に設定して再実行します。
 
 ```python
-RESUME_FROM_CHECKPOINT = True      # チェックポイントから再開するか
+RESUME_FROM_CHECKPOINT = True
 LOAD_OPTIMIZER_STATE = False       # 新実装ではFalse推奨
 LOAD_SCHEDULER_STATE = False       # 新実装ではFalse推奨
 ```
@@ -144,7 +169,7 @@ LOAD_SCHEDULER_STATE = False       # 新実装ではFalse推奨
 ### 最初からやり直す場合
 
 ```bash
-rm checkpoint.pth best_model.pth
+del checkpoint_fold*.pth best_model_fold*.pth
 python train.py
 ```
 
@@ -153,22 +178,12 @@ python train.py
 ### 音源分離結果の WAV 出力
 
 ```bash
-# 全ファイルを変換
 python export_separated_wav.py
-
-# 特定のファイルだけ変換
 python export_separated_wav.py train_0 train_1
-
-# パスを直接指定
-python export_separated_wav.py data/separated/train_1.npz
-
-# 特定のチャンネルだけ出力
 python export_separated_wav.py --channels vocals drums
 ```
 
 ## 設定パラメータ（config.py）
-
-すべてのハイパーパラメータは `config.py` で管理しています。
 
 ### 基本設定
 
@@ -179,7 +194,7 @@ python export_separated_wav.py --channels vocals drums
 | `SR` | 22050 | サンプリングレート |
 | `IMG_SIZE` | 600 | リサイズ後の画像サイズ |
 | `NUM_CLASSES` | 10 | 分類クラス数 |
-| `NUM_CHANNELS` | 4 | 入力チャンネル数（4stem） |
+| `NUM_CHANNELS` | 3 | 入力チャンネル数（original / accompaniment / vocals） |
 
 ### 学習設定
 
@@ -187,11 +202,21 @@ python export_separated_wav.py --channels vocals drums
 |---|---|---|
 | `BATCH_SIZE` | 24 | バッチサイズ |
 | `EPOCHS` | 50 | 最大エポック数 |
-| `LR` | 2e-4 | 学習率 |
-| `WEIGHT_DECAY` | 1e-4 | 重み減衰 |
-| `TEST_SIZE` | 0.1 | 検証データの割合 |
-| `PATIENCE` | 10 | Early Stopping の patience |
+| `LR` | 3e-4 | 学習率 |
+| `WEIGHT_DECAY` | 1.25e-4 | 重み減衰 |
+| `N_FOLDS` | 5 | K-Fold 分割数（0 で CV スキップ） |
+| `PATIENCE` | 5 | Early Stopping の patience |
 | `USE_AMP` | True | Mixed Precision Training |
+
+### 外部データ設定
+
+| パラメータ | デフォルト値 | 説明 |
+|---|---|---|
+| `USE_MAGNA_DATA` | True | MagnaTagATune データを学習に含めるか |
+| `MAGNA_DATASET_DIR` | data/TheMagnaTagATuneDataset | データセットのディレクトリ |
+| `MAGNA_SAMPLES_PER_CLASS` | 50 | クラスあたりのサンプル数 |
+| `USE_GTZAN_DATA` | True | GTZAN データを学習に含めるか |
+| `GTZAN_GENRES_DIR` | data/GTZAN_Dataset/Data/genres_original | GTZAN ジャンルフォルダのディレクトリ |
 
 ### 音源分離設定
 
@@ -202,67 +227,61 @@ python export_separated_wav.py --channels vocals drums
 
 ### データオーギュメンテーション設定
 
+#### 音声波形ベース（50% の確率で適用、3ch 同一パラメータ）
+
 | パラメータ | デフォルト値 | 説明 |
 |---|---|---|
-| `AUGMENT_PITCH_SHIFT` | True | ピッチシフト（±2半音） |
-| `AUGMENT_TIME_STRETCH` | True | タイムストレッチ（0.8〜1.2倍） |
-| `AUGMENT_ADD_NOISE` | True | ガウシアンノイズ追加 |
-| `AUGMENT_TIME_SHIFT` | True | タイムシフト（±0.2秒） |
-| `AUGMENT_TIME_MASKING` | True | SpecAugment Time Masking |
-| `AUGMENT_FREQUENCY_MASKING` | True | SpecAugment Frequency Masking |
+| `AUGMENT_PITCH_SHIFT` | True | ピッチシフト（±2 半音） |
+| `AUGMENT_TIME_STRETCH` | True | タイムストレッチ（0.8〜1.2 倍速） |
+| `AUGMENT_ADD_NOISE` | True | ガウシアンノイズ追加（std 0.001〜0.01） |
+| `AUGMENT_TIME_SHIFT` | True | タイムシフト（±0.2 秒） |
 
-各オーギュメンテーションは50%の確率で適用されます。4チャンネル（vocals / drums / bass / other）に同一パラメータを適用し、チャンネル間の整合性を維持します。
+#### SpecAugment（メルスペクトログラムベース、50% の確率で適用）
 
-### バッチサイズの調整目安
+| パラメータ | デフォルト値 | 説明 |
+|---|---|---|
+| `AUGMENT_TIME_MASKING` | True | Time Masking |
+| `AUGMENT_FREQUENCY_MASKING` | True | Frequency Masking |
 
-GPUメモリに応じて `config.py` の `BATCH_SIZE` を調整してください：
+#### バッチ単位（学習ループ内で適用）
 
-- **RTX3090 (24GB)**: 16-24
-- **RTX3080 (10GB)**: 8-16
-- **RTX3060 (12GB)**: 8-16
-- **CPU**: 2-4
+| パラメータ | デフォルト値 | 説明 |
+|---|---|---|
+| `AUGMENT_CUTMIX` | False | CutMix（矩形切り貼り + ラベル混合） |
+| `AUGMENT_MIXUP` | False | MixUp（ピクセル線形混合 + ラベル混合） |
+| `AUGMENT_CUTOUT` | False | CutOut（矩形ゼロマスク） |
 
-## 出力ファイル
+### 出力ファイル
 
 | ファイル | 説明 |
 |---|---|
-| `checkpoint.pth` | 学習チェックポイント（ベストモデル更新時・中断時に保存） |
-| `best_model.pth` | ベストモデル（検証精度が最高のモデル） |
+| `checkpoint_fold{N}.pth` | 学習チェックポイント（Fold ごと） |
+| `best_model_fold{N}.pth` | ベストモデル（Fold ごと、最終モデルは fold=N_FOLDS） |
 | `submit.csv` | テストデータの予測結果（提出用） |
-| `train_log.txt` | 学習ログ（コンソール出力と同一内容） |
-| `data/separated/*.npz` | 音源分離のキャッシュ（vocals / drums / bass / other の波形） |
+| `train_log.txt` | 学習ログ |
+| `data/augmentation_profile.csv` | オーギュメンテーション設定プロファイル |
+| `data/magna_sampled.csv` | MagnaTagATune のサンプリング結果 |
+| `data/gtzan_profile.csv` | GTZAN 使用ファイル一覧 |
+| `data/separated/*.npz` | 音源分離のキャッシュ |
+| `data/precomputed_mel.npz` | メルスペクトログラムのキャッシュ |
 
 ## トラブルシューティング
 
 ### CUDA out of memory
 
-`config.py` の `BATCH_SIZE` を小さくしてください。
-
-```python
-BATCH_SIZE = 8  # メモリ不足時に下げる
-```
-
-`IMG_SIZE` を小さくすることでも対応可能です（例: 600 → 300）。
+`config.py` の `BATCH_SIZE` を小さくしてください。`IMG_SIZE` を下げることでも対応可能です（例: 600 → 300）。
 `USE_AMP = True` が有効になっていることも確認してください。
-
-### 学習が遅い
-
-- GPUが使用されているか確認: `nvidia-smi`
-- スクリプト実行時に `Device: cuda` と表示されることを確認
-- `num_workers` は Windows では 0 推奨
 
 ### 音源分離に時間がかかる
 
 初回実行時のみ Demucs による音源分離が実行されます。分離結果は `data/separated/` にキャッシュされるため、2回目以降はスキップされます。
-
-旧3ch形式のキャッシュが残っている場合は自動的に検出され、4stem 形式で再分離されます。
 
 ### チェックポイントの互換性エラー
 
 モデル構造を変更した場合、古いチェックポイントは読み込めません。
 
 ```bash
-rm checkpoint.pth best_model.pth
+del checkpoint_fold*.pth best_model_fold*.pth
 ```
 
 で削除してから再学習してください。
@@ -273,11 +292,3 @@ rm checkpoint.pth best_model.pth
 - [Demucs - Music Source Separation](https://github.com/facebookresearch/demucs)
 - [librosa Documentation](https://librosa.org/doc/latest/index.html)
 - [PyTorch Documentation](https://pytorch.org/docs/stable/index.html)
-
-## ライセンス
-
-このプロジェクトは学習・研究目的で使用してください。
-
-## 作成者
-
-SIGNATE 音楽ジャンル分類コンペティション用実装
