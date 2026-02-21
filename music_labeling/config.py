@@ -28,8 +28,8 @@ EPOCHS = 50               # 最大エポック数
 LR = 2.5e-4                 # 学習率（バッチサイズ増加に伴い学習率も調整）
 # LR = 0.000154                 # 学習率（バッチサイズ増加に伴い学習率も調整）
 WEIGHT_DECAY = 1e-4       # 重み減衰
-# N_FOLDS = 5               # K-Fold 交差検証の分割数（0 で CV スキップ、全データで直接学習）
-N_FOLDS = 0               # K-Fold 交差検証の分割数（0 で CV スキップ、全データで直接学習）
+N_FOLDS = 5               # K-Fold 交差検証の分割数（0 で CV スキップ、全データで直接学習）
+# N_FOLDS = 0               # K-Fold 交差検証の分割数（0 で CV スキップ、全データで直接学習）
 
 # ==============================================================================
 # チェックポイント設定
@@ -41,7 +41,7 @@ LOAD_SCHEDULER_STATE = False       # スケジューラの状態も読み込む�
 # ==============================================================================
 # データオーギュメンテーション設定
 # ==============================================================================
-# 7パターン方式: 元音声 + 6種類の拡張をランダムに1つ選択
+# 8パターン方式: 元音声 + 7種類の拡張（含 vocal_drop）をランダムに1つ選択
 # augment=True 時、毎回 random.choice で1パターンを適用
 AUDIO_DURATION = 30               # 全パターン共通: fix_length の目標秒数
 
@@ -69,6 +69,11 @@ NOISE_LEVEL_MAX = 0.015
 ROLL_FRAC_MIN = 0.1
 ROLL_FRAC_MAX = 0.5
 
+# ボーカル除去オーギュメンテーション（ジャンル別確率で伴奏のみにする）
+AUGMENT_VOCAL_DROP = True            # ボーカル抜きオーギュメンテーションを適用するか
+VOCAL_INTEGRAL_THRESHOLD = 2500      # ボーカル積分値の閾値（これ以下を「低ボーカル」とみなす）
+VOCAL_DROP_TARGET_RATIO = 0.5        # ジャンルごとの低ボーカル割合の目標値
+
 # SpecAugment（メルスペクトログラムベース）
 AUGMENT_TIME_MASKING = True       # Time Maskingを適用するか
 AUGMENT_FREQUENCY_MASKING = True  # Frequency Maskingを適用するか
@@ -93,13 +98,23 @@ AUGMENT_CUTOUT_RATIO = 0.15    # マスクの辺の長さ（画像辺に対す�
 USE_MAGNA_DATA = True                          # MagnaTagATune データを学習に含めるか
 MAGNA_DATASET_DIR = 'data/TheMagnaTagATuneDataset'
 MAGNA_ANNOTATIONS_FILE = 'data/TheMagnaTagATuneDataset/annotations_final.csv'
-MAGNA_SAMPLES_PER_CLASS = 50                   # クラスあたりのサンプル数（均等サンプリング）
+MAGNA_SAMPLES_PER_CLASS = 52                   # クラスあたりのサンプル数（均等サンプリング）
 
 # ==============================================================================
 # GTZAN 外部データセット設定
 # ==============================================================================
-USE_GTZAN_DATA = False                          # GTZAN データを学習に含めるか
+USE_GTZAN_DATA = True                          # GTZAN データを学習に含めるか
 GTZAN_GENRES_DIR = 'data/GTZAN_Dataset/Data/genres_original'
+
+# ==============================================================================
+# FMA (Free Music Archive) 外部データセット設定
+# ==============================================================================
+USE_FMA_DATA = True                            # FMA データを学習に含めるか
+FMA_BASE_DIR = 'data/FMA-Free_Music_Archive-Small&Medium'
+FMA_TRACKS_CSV = 'data/FMA-Free_Music_Archive-Small&Medium/fma_metadata/tracks.csv'
+FMA_SUBSETS = ['small', 'medium']              # 使用するサブセット
+FMA_MIN_DURATION = 30                          # 最小秒数（これ以上の曲のみ使用、先頭30秒を切り出す）
+FMA_SAMPLES_PER_CLASS = 365                    # クラスあたりのサンプル数（均等サンプリング）
 
 # ==============================================================================
 # 音源分離設定（Demucs）
@@ -124,4 +139,4 @@ USE_AMP = True                # Mixed Precision Training（VRAM約40-50%削減�
 # ==============================================================================
 # Early Stopping設定
 # ==============================================================================
-PATIENCE = 5             # Early Stoppingのpatience
+PATIENCE = 8             # Early Stoppingのpatience

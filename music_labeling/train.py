@@ -4,6 +4,7 @@
 3チャンネルメルスペクトログラムで Fine-tuning
 """
 
+import ast
 import os
 import glob
 import signal
@@ -184,11 +185,19 @@ def batch_separate(file_list, demucs_model, cache_dir=SEPARATION_CACHE_DIR, sr=S
     )
     if cached_4stem == len(file_list):
         print(f"  全{len(file_list)}ファイルが4ステムキャッシュ済み")
-        return
+        return []
     print(f"  4ステムキャッシュ済み: {cached_4stem}/{len(file_list)}, "
           f"残り{len(file_list) - cached_4stem}ファイルを分離中...")
+    failed = []
     for f in tqdm(file_list, desc="  音源分離"):
-        separate_audio_cached(f, demucs_model, cache_dir, sr, device)
+        try:
+            separate_audio_cached(f, demucs_model, cache_dir, sr, device)
+        except Exception as e:
+            print(f"\n  [SKIP] {f}: {e}")
+            failed.append(f)
+    if failed:
+        print(f"  ⚠ {len(failed)} ファイルの読み込みに失敗しました")
+    return failed
 
 
 # ==============================================================================
@@ -212,8 +221,8 @@ def extract_melspectrogram(y, sr=SR, n_mels=None):
 
 
 # ==============================================================================
-# オーギュメンテーション（7パターン方式）
-# 元音声 + 6種の拡張を事前に定義し、毎回ランダムに1つ選択
+# オーギュメンテーション（8パターン方式）
+# 元音声 + 7種の拡張（含 vocal_drop）を事前に定義し、毎回ランダムに1つ選択
 # ==============================================================================
 AUGMENT_TYPES = [
     'original',       # 元音声そのまま
@@ -223,14 +232,15 @@ AUGMENT_TYPES = [
     'stretch_fast',   # テンポを速くする
     'noise',          # ガウシアンノイズ追加
     'time_shift',     # 循環シフト
+    'vocal_drop',     # ボーカル除去（伴奏のみ）
 ]
 
 
 def generate_augment_variant(sr=SR):
-    """7パターンからランダムに1つ選び、パラメータを生成
+    """8パターンからランダムに1つ選び、パラメータを生成
 
     3チャンネル（原音・伴奏・ボーカル）に同一パラメータを適用するため、
-    パラメータを事前に決定して返す。
+    パラメータを事前に決定して返す。vocal_drop は __getitem__ で特殊処理。
     """
     aug_type = np.random.choice(AUGMENT_TYPES)
     params = {'type': aug_type}
@@ -592,6 +602,106 @@ def load_gtzan_data(label_master, genres_dir):
     return files, np.array(labels, dtype=np.int64)
 
 
+# FMA genre_id -> label_master label_name のマッピング
+FMA_GENRE_ID_TO_LABEL = {
+    3: 'blues', 4: 'jazz', 5: 'classical', 9: 'country',
+    10: 'pop', 12: 'rock', 21: 'hiphop',
+    11: 'disco', 31: 'metal', 79: 'reggae', 602: 'reggae',
+}
+FMA_GENRE_TOP_TO_LABEL = {
+    'Blues': 'blues', 'Classical': 'classical', 'Country': 'country',
+    'Hip-Hop': 'hiphop', 'Jazz': 'jazz', 'Pop': 'pop', 'Rock': 'rock',
+}
+
+
+def load_fma_data(label_master, base_dir, tracks_csv, subsets, min_duration,
+                  samples_per_class, seed=SEED):
+    """FMA Dataset からジャンルラベル付きサンプルを均等サンプリングして返す
+
+    1. tracks.csv を読み込み、subset と duration >= min_duration でフィルタ
+    2. genre_top / genres_all からラベルを割り当て
+    3. クラスごとに samples_per_class 件を均等サンプリング
+    4. track_id からファイルパスを解決
+
+    Returns:
+        (file_list, labels): ファイルパスのリストと label_id の numpy 配列
+    """
+    tracks = pd.read_csv(tracks_csv, header=[0, 1, 2], low_memory=False)
+
+    tid_col = tracks.columns[0]
+    sub_col = [c for c in tracks.columns if c[1] == 'subset'][0]
+    dur_col = [c for c in tracks.columns if c[1] == 'duration'][0]
+    gtop_col = [c for c in tracks.columns if c[1] == 'genre_top'][0]
+    gall_col = [c for c in tracks.columns if c[1] == 'genres_all'][0]
+
+    mask = tracks[sub_col].isin(subsets) & (tracks[dur_col] >= min_duration)
+    df = tracks[mask].copy()
+    print(f"  FMA フィルタ後: {len(df)} 件 (subset={subsets}, duration>={min_duration}s)")
+
+    label_name_to_id = label_master.set_index('label_name')['label_id'].to_dict()
+    id_to_name = {v: k for k, v in label_name_to_id.items()}
+
+    # audio_dirs: fma_small/fma_small, fma_medium/fma_medium を検索パスに
+    audio_dirs = []
+    for sub in subsets:
+        d = os.path.join(base_dir, f'fma_{sub}', f'fma_{sub}')
+        if os.path.isdir(d):
+            audio_dirs.append(d)
+
+    def resolve_path(track_id):
+        fname = f'{int(track_id):06d}.mp3'
+        folder = fname[:3]
+        for ad in audio_dirs:
+            p = os.path.join(ad, folder, fname)
+            if os.path.isfile(p):
+                return p
+        return None
+
+    def assign_label(row):
+        gall_str = row[gall_col]
+        gids = []
+        if pd.notna(gall_str) and gall_str != '':
+            try:
+                gids = list(ast.literal_eval(gall_str))
+            except Exception:
+                pass
+        for gid in [11, 31, 79, 602]:
+            if gid in gids:
+                return FMA_GENRE_ID_TO_LABEL[gid]
+        top = row[gtop_col]
+        if pd.notna(top) and top in FMA_GENRE_TOP_TO_LABEL:
+            return FMA_GENRE_TOP_TO_LABEL[top]
+        for gid in gids:
+            if gid in FMA_GENRE_ID_TO_LABEL:
+                return FMA_GENRE_ID_TO_LABEL[gid]
+        return None
+
+    df['_label_name'] = df.apply(assign_label, axis=1)
+    df = df[df['_label_name'].notna()].copy()
+    df['_label_id'] = df['_label_name'].map(label_name_to_id)
+    df['_path'] = df[tid_col].apply(resolve_path)
+    df = df[df['_path'].notna()].copy()
+
+    by_class = {lid: [] for lid in range(len(label_name_to_id))}
+    for _, row in df.iterrows():
+        by_class[int(row['_label_id'])].append(row['_path'])
+
+    rng = np.random.RandomState(seed)
+    sampled_files, sampled_labels = [], []
+    print(f"  FMA ジャンル別利用可能数:")
+    for label_id in range(len(label_name_to_id)):
+        candidates = by_class[label_id]
+        n = min(samples_per_class, len(candidates))
+        name = id_to_name.get(label_id, f'id{label_id}')
+        print(f"    {name:<12} {len(candidates):>6} 件 → {n} 件サンプリング")
+        if n > 0:
+            chosen = rng.choice(candidates, n, replace=False)
+            sampled_files.extend(chosen)
+            sampled_labels.extend([label_id] * n)
+
+    return sampled_files, np.array(sampled_labels, dtype=np.int64)
+
+
 # ==============================================================================
 # 音源分離の実行（Windows multiprocessing のため __main__ 内で実行）
 # ==============================================================================
@@ -649,9 +759,35 @@ if __name__ == '__main__':
         gtzan_profile.to_csv(gtzan_csv_path, index=False)
         print(f"  プロファイルを保存: {gtzan_csv_path} ({len(gtzan_profile)} 件)")
 
+    # FMA 外部データの追加
+    fma_labels = None
+    if getattr(config, 'USE_FMA_DATA', False):
+        fma_base = getattr(config, 'FMA_BASE_DIR',
+                           'data/FMA-Free_Music_Archive-Small&Medium')
+        fma_csv = getattr(config, 'FMA_TRACKS_CSV',
+                          'data/FMA-Free_Music_Archive-Small&Medium/fma_metadata/tracks.csv')
+        fma_subs = getattr(config, 'FMA_SUBSETS', ['small', 'medium'])
+        fma_dur = getattr(config, 'FMA_MIN_DURATION', 30)
+        fma_n = getattr(config, 'FMA_SAMPLES_PER_CLASS', 100)
+        print(f"\n=== FMA 外部データ読み込み ({fma_n} 件/クラス) ===")
+        fma_files, fma_labels = load_fma_data(
+            label_master, fma_base, fma_csv, fma_subs, fma_dur, fma_n, seed=SEED)
+        train_files = train_files + fma_files
+        print(f"  追加: {len(fma_files)} 件 → 学習ファイル合計: {len(train_files)} 件")
+
+        id_to_name = label_master.set_index('label_id')['label_name'].to_dict()
+        fma_profile = pd.DataFrame({
+            'file_path': fma_files,
+            'label_id': fma_labels,
+            'label_name': [id_to_name[lid] for lid in fma_labels],
+        })
+        fma_csv_path = 'data/fma_sampled.csv'
+        fma_profile.to_csv(fma_csv_path, index=False)
+        print(f"  サンプリング結果を保存: {fma_csv_path} ({len(fma_profile)} 件)")
+
     # オーギュメンテーション設定プロファイルを CSV に出力
     aug_profile = {
-        'method': '7-variant random selection',
+        'method': '8-variant random selection (incl. vocal_drop)',
         'audio_duration_sec': config.AUDIO_DURATION,
         'pitch_up_min': config.PITCH_UP_MIN,
         'pitch_up_max': config.PITCH_UP_MAX,
@@ -694,16 +830,102 @@ if __name__ == '__main__':
     print(f"Demucsサンプルレート: {demucs_model.samplerate} Hz")
 
     print("\n学習データの音源分離:")
-    batch_separate(train_files, demucs_model, SEPARATION_CACHE_DIR, SR, DEVICE)
+    train_failed = batch_separate(train_files, demucs_model, SEPARATION_CACHE_DIR, SR, DEVICE)
 
     print("\nテストデータの音源分離:")
     batch_separate(test_files, demucs_model, SEPARATION_CACHE_DIR, SR, DEVICE)
+
+    if train_failed:
+        failed_set = set(train_failed)
+        old_len = len(train_files)
+        # train_files とラベル配列を同期して除外
+        all_labels = np.concatenate([
+            train_master['label_id'].values,
+            magna_labels if magna_labels is not None else np.array([], dtype=np.int64),
+            gtzan_labels if gtzan_labels is not None else np.array([], dtype=np.int64),
+            fma_labels if fma_labels is not None else np.array([], dtype=np.int64),
+        ])
+        keep = [f not in failed_set for f in train_files]
+        train_files = [f for f, k in zip(train_files, keep) if k]
+        all_labels = all_labels[keep]
+
+        # 各セグメントのラベルを再構築
+        n_magna = len(magna_labels) if magna_labels is not None else 0
+        n_gtzan = len(gtzan_labels) if gtzan_labels is not None else 0
+        n_fma_seg = len(fma_labels) if fma_labels is not None else 0
+        seg_orig = sum(keep[:n_original_train])
+        seg_magna = sum(keep[n_original_train:n_original_train + n_magna])
+        seg_gtzan = sum(keep[n_original_train + n_magna:n_original_train + n_magna + n_gtzan])
+        train_master = train_master.iloc[[i for i, k in enumerate(keep[:n_original_train]) if k]]
+        if magna_labels is not None:
+            magna_labels = all_labels[seg_orig:seg_orig + seg_magna]
+        if gtzan_labels is not None:
+            gtzan_labels = all_labels[seg_orig + seg_magna:seg_orig + seg_magna + seg_gtzan]
+        if fma_labels is not None:
+            fma_labels = all_labels[seg_orig + seg_magna + seg_gtzan:]
+        n_original_train = seg_orig
+        print(f"  → 学習ファイル数: {len(train_files)} (除外: {old_len - len(train_files)} 件)")
 
     # Demucsモデルを解放してGPUメモリを確保
     del demucs_model
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
     print("\nDemucsモデルを解放しました")
+
+    # ==============================================================================
+    # ボーカル積分値の統計（vocal_drop augmentation の参考情報）
+    # ==============================================================================
+    VOCAL_INTEGRAL_THRESHOLD = 2500.0
+    id_to_name = label_master.set_index('label_id')['label_name'].to_dict()
+
+    def _compute_vocal_integrals(file_list, cache_dir):
+        vals = []
+        for f in file_list:
+            basename = os.path.splitext(os.path.basename(f))[0]
+            cp = os.path.join(cache_dir, f"{basename}.npz")
+            if os.path.exists(cp):
+                d = np.load(cp)
+                voc = d['vocals'] if 'vocals' in d else None
+                d.close()
+                vals.append(float(np.abs(voc).sum()) if voc is not None else 0.0)
+            else:
+                vals.append(0.0)
+        return np.array(vals)
+
+    print(f"\n=== Vocal Integral 統計 (threshold <= {VOCAL_INTEGRAL_THRESHOLD}) ===")
+
+    # 学習・テストそれぞれ算出
+    vi_train = _compute_vocal_integrals(train_files, SEPARATION_CACHE_DIR)
+    vi_test = _compute_vocal_integrals(test_files, SEPARATION_CACHE_DIR)
+    vi_all = np.concatenate([vi_train, vi_test])
+
+    low_train = np.sum(vi_train <= VOCAL_INTEGRAL_THRESHOLD)
+    low_test = np.sum(vi_test <= VOCAL_INTEGRAL_THRESHOLD)
+    low_all = low_train + low_test
+    n_train = len(vi_train)
+    n_test = len(vi_test)
+    n_total = n_train + n_test
+
+    print(f"=== Values <= {VOCAL_INTEGRAL_THRESHOLD} ===")
+    print(f"Train: {low_train} / {n_train} = {100*low_train/max(n_train,1):.1f}% ({low_train/max(n_train,1)*10:.2f}割)")
+    print(f"Test: {low_test} / {n_test} = {100*low_test/max(n_test,1):.1f}% ({low_test/max(n_test,1)*10:.2f}割)")
+    print(f"Total: {low_all} / {n_total} = {100*low_all/max(n_total,1):.1f}% ({low_all/max(n_total,1)*10:.2f}割)")
+
+    # 学習データのラベル別内訳（y_all はまだ構築前なので一時的に構築）
+    y_tmp = train_master['label_id'].values
+    if magna_labels is not None and len(magna_labels) > 0:
+        y_tmp = np.concatenate([y_tmp, magna_labels])
+    if gtzan_labels is not None and len(gtzan_labels) > 0:
+        y_tmp = np.concatenate([y_tmp, gtzan_labels])
+
+    print(f"\nTrain by label (values <= {VOCAL_INTEGRAL_THRESHOLD}):")
+    for lid in sorted(id_to_name.keys()):
+        name = id_to_name[lid]
+        mask = y_tmp == lid
+        total_cls = int(mask.sum())
+        low_cls = int(np.sum((vi_train <= VOCAL_INTEGRAL_THRESHOLD) & mask))
+        pct = 100 * low_cls / max(total_cls, 1)
+        print(f"  {name:<12} {low_cls:>4} / {total_cls:>4} = {pct:>5.1f}% ({pct/10:.2f}割)")
 
     # ==============================================================================
     # 3チャンネル メルスペクトログラム（キャッシュがあればロード短縮）
@@ -747,7 +969,66 @@ if __name__ == '__main__':
     if gtzan_labels is not None and len(gtzan_labels) > 0:
         y_all = np.concatenate([y_all, gtzan_labels])
         n_gtzan = len(gtzan_labels)
-    print(f"y_all shape: {y_all.shape} (original: {n_original_train}, magna: {n_magna}, gtzan: {n_gtzan})")
+    n_fma = 0
+    if fma_labels is not None and len(fma_labels) > 0:
+        y_all = np.concatenate([y_all, fma_labels])
+        n_fma = len(fma_labels)
+    print(f"y_all shape: {y_all.shape} (original: {n_original_train}, magna: {n_magna}, gtzan: {n_gtzan}, fma: {n_fma})")
+
+    # ==============================================================================
+    # ボーカル積分値の事前計算（全学習データ）
+    # ==============================================================================
+    vocal_integrals_all = None
+    if getattr(config, 'AUGMENT_VOCAL_DROP', False):
+        print("\n=== ボーカル積分値の計算 ===")
+        vocal_integrals_all = []
+        for f in tqdm(train_files, desc="  vocal integral"):
+            basename = os.path.splitext(os.path.basename(f))[0]
+            cp = os.path.join(SEPARATION_CACHE_DIR, f"{basename}.npz")
+            if os.path.exists(cp):
+                d = np.load(cp)
+                voc = d['vocals'] if 'vocals' in d else None
+                d.close()
+                vocal_integrals_all.append(float(np.abs(voc).sum()) if voc is not None else 0.0)
+            else:
+                vocal_integrals_all.append(0.0)
+        vocal_integrals_all = np.array(vocal_integrals_all)
+
+
+def compute_genre_drop_prob(y, vocal_integrals, label_master):
+    """ジャンルごとのボーカル抜き適用確率を計算し、ログを出力
+
+    低ボーカル(≤閾値) / 高ボーカル(>閾値) の比率が target_ratio に近づくよう
+    高ボーカルサンプルに対する適用確率を算出する。
+    """
+    from collections import defaultdict
+    th = getattr(config, 'VOCAL_INTEGRAL_THRESHOLD', 2500)
+    target_ratio = getattr(config, 'VOCAL_DROP_TARGET_RATIO', 0.5)
+    id_to_name = label_master.set_index('label_id')['label_name'].to_dict()
+
+    by_label = defaultdict(list)
+    for i in range(len(y)):
+        by_label[int(y[i])].append(vocal_integrals[i])
+
+    genre_drop_prob = {}
+    print(f"\n  ボーカル抜きオーギュメンテーション内訳 (閾値={th}, 目標割合={target_ratio:.0%})")
+    print(f"  {'ジャンル':<12} {'低(≤th)':>8} {'高(>th)':>8} {'適用確率':>10} {'現在の割合':>10} {'期待割合':>10}")
+    print("  " + "-" * 58)
+    for label_id in range(config.NUM_CLASSES):
+        vals = by_label.get(label_id, [])
+        L = sum(1 for v in vals if v <= th)
+        H = len(vals) - L
+        n = L + H
+        p = (target_ratio * (H - L) / H) if H > 0 else 0.0
+        genre_drop_prob[label_id] = float(np.clip(p, 0.0, 1.0))
+        curr_ratio = L / n if n else 0
+        exp_low = L + genre_drop_prob[label_id] * H
+        exp_ratio = exp_low / n if n else 0
+        name = id_to_name.get(label_id, f"id{label_id}")
+        print(f"  {name:<12} {L:>8} {H:>8} {genre_drop_prob[label_id]:>10.2%} {curr_ratio:>10.1%} {exp_ratio:>10.1%}")
+    print("  " + "-" * 58)
+
+    return genre_drop_prob
 
 
 # ==============================================================================
@@ -763,7 +1044,8 @@ class MelSpectrogramDataset(Dataset):
 
     def __init__(self, X, file_list=None, y=None, img_size=IMG_SIZE,
                  augment=False, sr=SR, n_mels=N_MELS, max_frames=None,
-                 cache_dir=SEPARATION_CACHE_DIR):
+                 cache_dir=SEPARATION_CACHE_DIR,
+                 vocal_integrals=None, genre_drop_prob=None):
         self.X = X  # (N, 3, n_mels, time_frames)
         self.file_list = file_list
         self.y = y
@@ -773,6 +1055,8 @@ class MelSpectrogramDataset(Dataset):
         self.n_mels = n_mels
         self.max_frames = max_frames
         self.cache_dir = cache_dir
+        self.vocal_integrals = vocal_integrals
+        self.genre_drop_prob = genre_drop_prob
 
         # 正規化パラメータ（チャンネルごとに計算）
         self.ch_means = np.array([X[:, ch].mean() for ch in range(3)])  # (3,)
@@ -794,16 +1078,32 @@ class MelSpectrogramDataset(Dataset):
             accompaniment = accompaniment.copy()
             vocals = vocals.copy()
 
-            # 7パターンからランダムに1つ選択し、3チャンネルに同一適用
+            # ボーカル抜きオーギュメンテーション: 積分>閾値のサンプルをジャンル別確率で伴奏のみに
+            if (self.vocal_integrals is not None and self.genre_drop_prob is not None
+                    and self.y is not None):
+                th = getattr(config, 'VOCAL_INTEGRAL_THRESHOLD', 2500)
+                label_id = int(self.y[idx])
+                p = self.genre_drop_prob.get(label_id, 0.0)
+                if self.vocal_integrals[idx] > th and p > 0 and np.random.random() < p:
+                    vocals = np.zeros_like(vocals)
+                    original = accompaniment.copy()
+
+            # 8パターンからランダムに1つ選択し、3チャンネルに同一適用
             aug_params = generate_augment_variant(sr=self.sr)
             noise_seed = np.random.randint(0, 2**31)
 
-            original = apply_augment_variant(original, aug_params,
-                                             sr=self.sr, noise_seed=noise_seed)
-            accompaniment = apply_augment_variant(accompaniment, aug_params,
-                                                  sr=self.sr, noise_seed=noise_seed)
-            vocals = apply_augment_variant(vocals, aug_params,
-                                           sr=self.sr, noise_seed=noise_seed)
+            if aug_params['type'] == 'vocal_drop':
+                target_len = int(self.sr * getattr(config, 'AUDIO_DURATION', 30))
+                original = librosa.util.fix_length(accompaniment, size=target_len)
+                accompaniment = librosa.util.fix_length(accompaniment, size=target_len)
+                vocals = np.zeros(target_len, dtype=vocals.dtype)
+            else:
+                original = apply_augment_variant(original, aug_params,
+                                                 sr=self.sr, noise_seed=noise_seed)
+                accompaniment = apply_augment_variant(accompaniment, aug_params,
+                                                      sr=self.sr, noise_seed=noise_seed)
+                vocals = apply_augment_variant(vocals, aug_params,
+                                               sr=self.sr, noise_seed=noise_seed)
 
             # メルスペクトログラムに変換
             mel_orig = extract_melspectrogram(original, sr=self.sr, n_mels=self.n_mels)
@@ -870,12 +1170,26 @@ class MelSpectrogramDataset(Dataset):
 # ==============================================================================
 # K-Fold 学習ヘルパー
 # ==============================================================================
+def _print_per_genre_valid(all_labels, all_preds, id_to_name, num_classes=NUM_CLASSES):
+    """ジャンルごとの正解数/件数/正解率を1行ずつ表示"""
+    for c in range(num_classes):
+        mask = all_labels == c
+        n = int(mask.sum())
+        if n == 0:
+            continue
+        correct = int(((all_preds == all_labels) & mask).sum())
+        acc_c = 100.0 * correct / n
+        name = id_to_name.get(c, f"class_{c}")
+        print(f"    {name:<12} {correct:>3}/{n:<3} = {acc_c:>5.1f}%")
+
+
 def run_training_loop(model, train_loader, valid_loader, criterion, optimizer,
                       scheduler, fold=0, start_epoch=1, best_valid_acc=0,
-                      best_epoch=0, patience_counter=0):
+                      best_epoch=0, patience_counter=0, id_to_name=None):
     """1 Fold / 全データ学習の共通学習ループ
 
     valid_loader が None の場合は Early Stopping を行わず EPOCHS まで学習する。
+    id_to_name: label_id -> ジャンル名 の dict。指定時は Valid 計算後にジャンル別スコアを表示。
     Returns:
         best_valid_acc, best_epoch
     """
@@ -895,9 +1209,15 @@ def run_training_loop(model, train_loader, valid_loader, criterion, optimizer,
             train_loss, train_acc = train_one_epoch(model, train_loader, criterion, optimizer)
 
             if valid_loader is not None:
-                valid_loss, valid_acc = evaluate(model, valid_loader, criterion)
+                need_genre_scores = id_to_name is not None
+                if need_genre_scores:
+                    valid_loss, valid_acc, all_preds, all_labels = evaluate(
+                        model, valid_loader, criterion, return_predictions=True)
+                else:
+                    valid_loss, valid_acc = evaluate(model, valid_loader, criterion)
             else:
                 valid_loss, valid_acc = 0.0, 0.0
+                all_preds = all_labels = None
 
             scheduler.step()
             lr = optimizer.param_groups[0]['lr']
@@ -907,13 +1227,16 @@ def run_training_loop(model, train_loader, valid_loader, criterion, optimizer,
                       f"Train Loss: {train_loss:.4f} Acc: {train_acc:.4f} | "
                       f"Valid Loss: {valid_loss:.4f} Acc: {valid_acc:.4f} | "
                       f"LR: {lr:.6f}")
+                if need_genre_scores and all_preds is not None:
+                    print("  Valid by genre:")
+                    _print_per_genre_valid(all_labels, all_preds, id_to_name)
             else:
                 print(f"Epoch {epoch:3d}/{EPOCHS} | "
                       f"Train Loss: {train_loss:.4f} Acc: {train_acc:.4f} | "
                       f"LR: {lr:.6f}")
 
             if valid_loader is not None:
-                if valid_acc >= best_valid_acc:
+                if valid_acc > best_valid_acc:
                     best_valid_acc = valid_acc
                     best_epoch = epoch
                     patience_counter = 0
@@ -1036,7 +1359,8 @@ def train_one_epoch(model, loader, criterion, optimizer):
 
 
 @torch.no_grad()
-def evaluate(model, loader, criterion):
+def evaluate(model, loader, criterion, return_predictions=False):
+    """検証/評価: loss, accuracy を返す。return_predictions=True で全予測・ラベルも返す。"""
     model.eval()
     total_loss = 0
     all_preds, all_labels = [], []
@@ -1057,8 +1381,12 @@ def evaluate(model, loader, criterion):
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
+    all_preds = np.array(all_preds)
+    all_labels = np.array(all_labels)
     avg_loss = total_loss / len(loader.dataset)
     acc = accuracy_score(all_labels, all_preds)
+    if return_predictions:
+        return avg_loss, acc, all_preds, all_labels
     return avg_loss, acc
 
 
@@ -1165,9 +1493,17 @@ if __name__ == '__main__':
 
             print(f"  Train: {len(X_train)}, Valid: {len(X_valid)}")
 
+            # ボーカル抜き確率（Fold の学習分割から算出）
+            vi_fold = None
+            gdp_fold = None
+            if vocal_integrals_all is not None:
+                vi_fold = vocal_integrals_all[train_indices]
+                gdp_fold = compute_genre_drop_prob(y_train, vi_fold, label_master)
+
             train_dataset = MelSpectrogramDataset(
                 X_train, file_list=train_files_fold, y=y_train,
                 augment=True, max_frames=max_frames_train,
+                vocal_integrals=vi_fold, genre_drop_prob=gdp_fold,
             )
             valid_dataset = MelSpectrogramDataset(
                 X_valid, file_list=valid_files_fold, y=y_valid,
@@ -1204,10 +1540,12 @@ if __name__ == '__main__':
             else:
                 start_epoch, best_valid_acc, best_epoch, patience_counter = 1, 0, 0, 0
 
+            id_to_name = label_master.set_index('label_id')['label_name'].to_dict()
             best_valid_acc, best_epoch = run_training_loop(
                 model, train_loader, valid_loader, criterion, optimizer, scheduler,
                 fold=fold, start_epoch=start_epoch, best_valid_acc=best_valid_acc,
                 best_epoch=best_epoch, patience_counter=patience_counter,
+                id_to_name=id_to_name,
             )
 
             fold_scores.append(best_valid_acc)
@@ -1247,9 +1585,15 @@ if __name__ == '__main__':
         print(f"  Final training on ALL data")
         print(f"{'='*60}")
 
+        # ボーカル抜き確率（全データから算出）
+        gdp_full = None
+        if vocal_integrals_all is not None:
+            gdp_full = compute_genre_drop_prob(y_all, vocal_integrals_all, label_master)
+
         full_dataset = MelSpectrogramDataset(
             X_all, file_list=train_files, y=y_all,
             augment=True, max_frames=max_frames_train,
+            vocal_integrals=vocal_integrals_all, genre_drop_prob=gdp_full,
         )
         full_loader = DataLoader(
             full_dataset, batch_size=BATCH_SIZE, shuffle=True,
