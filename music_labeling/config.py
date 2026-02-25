@@ -6,6 +6,7 @@
 # 基本設定
 # ==============================================================================
 SEED = 42
+ENSEMBLE_SEEDS = [42, 123, 456, 789, 1024]  # アンサンブル用シードリスト（1個なら従来どおり単一モデル）
 
 # ==============================================================================
 # 音声処理設定
@@ -28,7 +29,7 @@ EPOCHS = 50               # 最大エポック数
 LR = 2.5e-4                 # 学習率（バッチサイズ増加に伴い学習率も調整）
 # LR = 0.000154                 # 学習率（バッチサイズ増加に伴い学習率も調整）
 WEIGHT_DECAY = 1e-4       # 重み減衰
-N_FOLDS = 5               # K-Fold 交差検証の分割数（0 で CV スキップ、全データで直接学習）
+N_FOLDS = 4               # K-Fold 交差検証の分割数（0 で CV スキップ、全データで直接学習）
 # N_FOLDS = 0               # K-Fold 交差検証の分割数（0 で CV スキップ、全データで直接学習）
 
 # ==============================================================================
@@ -70,9 +71,17 @@ ROLL_FRAC_MIN = 0.1
 ROLL_FRAC_MAX = 0.5
 
 # ボーカル除去オーギュメンテーション（ジャンル別確率で伴奏のみにする）
-AUGMENT_VOCAL_DROP = True            # ボーカル抜きオーギュメンテーションを適用するか
+AUGMENT_VOCAL_DROP = False            # ボーカル抜きオーギュメンテーションを適用するか
 VOCAL_INTEGRAL_THRESHOLD = 2500      # ボーカル積分値の閾値（これ以下を「低ボーカル」とみなす）
 VOCAL_DROP_TARGET_RATIO = 0.5        # ジャンルごとの低ボーカル割合の目標値
+# ジャンルごとにボーカル抜きをオン/オフ。未指定のジャンルは計算どおり適用する。
+VOCAL_DROP_BY_GENRE = {
+    # 'metal': False,
+    # 'pop': False,
+    # 'rock': False,
+    # 'classical': False,   # オフにする例
+    # 'jazz': False,
+}
 
 # SpecAugment（メルスペクトログラムベース）
 AUGMENT_TIME_MASKING = True       # Time Maskingを適用するか
@@ -93,28 +102,59 @@ AUGMENT_CUTOUT_N_HOLES = 1      # マスクする矩形の数
 AUGMENT_CUTOUT_RATIO = 0.15    # マスクの辺の長さ（画像辺に対する比率, 0〜1）
 
 # ==============================================================================
+# 外部データ Accuracy ベース・オーバーサンプリング設定
+# ==============================================================================
+# OVERSAMPLE_ACC_THRESHOLD 未満のジャンルに対して外部データを増量する。
+# 倍率 = (threshold - genre_acc) / threshold * max_multiplier + 1.0
+# 例: threshold=84, genre_acc=56, max_multiplier=3 → (84-56)/84*3+1 = 2.0 倍
+OVERSAMPLE_BY_ACCURACY = False                   # Accuracy ベースの外部データ増量を有効化
+OVERSAMPLE_ACC_THRESHOLD = 84.0                 # この Accuracy(%) 以下のジャンルを増量対象にする
+OVERSAMPLE_MAX_MULTIPLIER = 2.0                 # 最大倍率（最も低い Accuracy のジャンルに適用）
+OVERSAMPLE_GENRE_ACC = {                        # 直近 CV のジャンル別 Accuracy (%)
+    'blues':     70.58,
+    'classical': 93.58,
+    'country':   73.25,
+    'disco':     73.65,
+    'hiphop':    80.85,
+    'jazz':      75.95,
+    'metal':     84.03,
+    'pop':       55.23,
+    'reggae':    74.10,
+    'rock':      55.60,
+}
+# ジャンルごとの倍率を直接指定（Accuracy 計算式をオーバーライド）
+# 指定したジャンルは計算式を無視しこの倍率を使う。未指定ジャンルは計算式に従う。
+OVERSAMPLE_GENRE_MULT_OVERRIDE = {
+    'blues': 1.5,
+    'country': 1.6,
+    'hiphop': 1.7,
+    'pop':   2.0,
+    'rock':  2.0,
+}
+
+# ==============================================================================
 # MagnaTagATune 外部データセット設定
 # ==============================================================================
 USE_MAGNA_DATA = True                          # MagnaTagATune データを学習に含めるか
 MAGNA_DATASET_DIR = 'data/TheMagnaTagATuneDataset'
 MAGNA_ANNOTATIONS_FILE = 'data/TheMagnaTagATuneDataset/annotations_final.csv'
-MAGNA_SAMPLES_PER_CLASS = 52                   # クラスあたりのサンプル数（均等サンプリング）
+MAGNA_SAMPLES_PER_CLASS = 52                   # クラスあたりの基本サンプル数（均等サンプリング）
 
 # ==============================================================================
 # GTZAN 外部データセット設定
 # ==============================================================================
-USE_GTZAN_DATA = True                          # GTZAN データを学習に含めるか
+USE_GTZAN_DATA = False                          # GTZAN データを学習に含めるか
 GTZAN_GENRES_DIR = 'data/GTZAN_Dataset/Data/genres_original'
 
 # ==============================================================================
 # FMA (Free Music Archive) 外部データセット設定
 # ==============================================================================
-USE_FMA_DATA = True                            # FMA データを学習に含めるか
+USE_FMA_DATA = False                            # FMA データを学習に含めるか
 FMA_BASE_DIR = 'data/FMA-Free_Music_Archive-Small&Medium'
 FMA_TRACKS_CSV = 'data/FMA-Free_Music_Archive-Small&Medium/fma_metadata/tracks.csv'
 FMA_SUBSETS = ['small', 'medium']              # 使用するサブセット
 FMA_MIN_DURATION = 30                          # 最小秒数（これ以上の曲のみ使用、先頭30秒を切り出す）
-FMA_SAMPLES_PER_CLASS = 365                    # クラスあたりのサンプル数（均等サンプリング）
+FMA_SAMPLES_PER_CLASS = 74                    # クラスあたりの基本サンプル数（均等サンプリング）
 
 # ==============================================================================
 # 音源分離設定（Demucs）
@@ -137,6 +177,8 @@ LOG_FILE = 'train_log.txt'          # 学習ログの出力先
 USE_AMP = True                # Mixed Precision Training（VRAM約40-50%削減）
 
 # ==============================================================================
-# Early Stopping設定
+# Early Stopping / 強制終了設定
 # ==============================================================================
-PATIENCE = 8             # Early Stoppingのpatience
+PATIENCE = 9             # Early Stoppingのpatience
+# N_FOLDS=0（全データ学習）のとき、ここで指定したエポックで学習を打ち切る。None/0 のときは EPOCHS まで実行
+EPOCHS_TO_FORCE_FINISH = None   # 例: 30 にすると 30 エポックで終了

@@ -1,5 +1,5 @@
 """
-音楽ジャンル分類 - EfficientNet B3 (PyTorch)
+音楽ジャンル分類 - EfficientNet B7 (PyTorch)
 音源分離（Demucs）で原音・伴奏・ボーカルに分離し、
 3チャンネルメルスペクトログラムで Fine-tuning
 """
@@ -48,15 +48,23 @@ CHECKPOINT_FILE = config.CHECKPOINT_FILE
 BEST_MODEL_FILE = config.BEST_MODEL_FILE
 SUBMIT_FILE = config.SUBMIT_FILE
 PATIENCE = config.PATIENCE
+EPOCHS_TO_FORCE_FINISH = getattr(config, 'EPOCHS_TO_FORCE_FINISH', None)
 SEPARATION_CACHE_DIR = config.SEPARATION_CACHE_DIR
 SEPARATION_MODEL = config.SEPARATION_MODEL
+ENSEMBLE_SEEDS = getattr(config, 'ENSEMBLE_SEEDS', [SEED])
 
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-np.random.seed(SEED)
-torch.manual_seed(SEED)
-if torch.cuda.is_available():
-    torch.cuda.manual_seed_all(SEED)
+
+def set_seed(seed):
+    """再現性のためにすべての乱数ジェネレータのシードを設定"""
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+set_seed(SEED)
 
 print(f"Device: {DEVICE}")
 
@@ -485,6 +493,49 @@ def save_mel_cache(X_all, X_test_raw, max_frames_train, train_files, test_files,
 
 
 # ==============================================================================
+# Accuracy ベース・オーバーサンプリング倍率計算
+# ==============================================================================
+def compute_oversample_per_class(base_samples_per_class, label_master):
+    """config の OVERSAMPLE_GENRE_ACC に基づきジャンルごとのサンプル数 dict を返す。
+
+    OVERSAMPLE_BY_ACCURACY=False の場合は全ジャンル均等の dict を返す。
+    """
+    label_name_to_id = label_master.set_index('label_name')['label_id'].to_dict()
+    id_to_name = {v: k for k, v in label_name_to_id.items()}
+
+    enabled = getattr(config, 'OVERSAMPLE_BY_ACCURACY', False)
+    genre_acc = getattr(config, 'OVERSAMPLE_GENRE_ACC', {})
+    threshold = getattr(config, 'OVERSAMPLE_ACC_THRESHOLD', 84.0)
+    max_mult = getattr(config, 'OVERSAMPLE_MAX_MULTIPLIER', 3.0)
+    overrides = getattr(config, 'OVERSAMPLE_GENRE_MULT_OVERRIDE', {})
+
+    per_class = {}
+    print(f"  Oversample: enabled={enabled}, threshold={threshold}%, max_mult={max_mult}x")
+    for lid in sorted(id_to_name.keys()):
+        name = id_to_name[lid]
+        if name in overrides:
+            mult = overrides[name]
+            src = "override"
+        elif enabled:
+            acc = genre_acc.get(name)
+            if acc is not None and acc < threshold:
+                mult = (threshold - acc) / threshold * max_mult + 1.0
+                src = f"acc={acc:.1f}%"
+            else:
+                mult = 1.0
+                src = None
+        else:
+            mult = 1.0
+            src = None
+        n = int(round(base_samples_per_class * mult))
+        per_class[lid] = n
+        if mult > 1.0:
+            print(f"    {name:<12} x{mult:.2f} → {n} 件/クラス ({src})")
+
+    return per_class
+
+
+# ==============================================================================
 # MagnaTagATune 外部データセット読み込み
 # ==============================================================================
 MAGNA_GENRE_COL_MAP = {
@@ -557,18 +608,30 @@ def load_magna_data(label_master, dataset_dir, annotations_file,
     sampled_files, sampled_labels = [], []
     id_to_name = {v: k for k, v in label_name_to_id.items()}
 
+    shortfall = {}
+    chosen_set = set()
+    remaining_by_class = {}
+    base_n = min(samples_per_class.values()) if isinstance(samples_per_class, dict) else samples_per_class
     print(f"  MagnaTagATune ジャンル別利用可能数:")
     for label_id in range(len(label_name_to_id)):
         candidates = by_class[label_id]
-        n = min(samples_per_class, len(candidates))
+        spc = samples_per_class[label_id] if isinstance(samples_per_class, dict) else samples_per_class
+        n = min(spc, len(candidates))
         name = id_to_name.get(label_id, f'id{label_id}')
-        print(f"    {name:<12} {len(candidates):>6} 件 → {n} 件サンプリング")
+        mult_str = f" (x{spc/max(1,base_n):.1f})" if spc != base_n else ""
+        deficit = spc - n
+        deficit_str = f"  [不足: {deficit}]" if deficit > 0 else ""
+        print(f"    {name:<12} {len(candidates):>6} 件 → {n} 件サンプリング{mult_str}{deficit_str}")
+        if deficit > 0:
+            shortfall[label_id] = deficit
         if n > 0:
-            chosen = rng.choice(candidates, n, replace=False)
+            chosen = list(rng.choice(candidates, n, replace=False))
             sampled_files.extend(chosen)
             sampled_labels.extend([label_id] * n)
+            chosen_set.update(chosen)
+        remaining_by_class[label_id] = [c for c in candidates if c not in chosen_set]
 
-    return sampled_files, np.array(sampled_labels, dtype=np.int64)
+    return sampled_files, np.array(sampled_labels, dtype=np.int64), shortfall, remaining_by_class
 
 
 def load_gtzan_data(label_master, genres_dir):
@@ -683,23 +746,35 @@ def load_fma_data(label_master, base_dir, tracks_csv, subsets, min_duration,
     df = df[df['_path'].notna()].copy()
 
     by_class = {lid: [] for lid in range(len(label_name_to_id))}
-    for _, row in df.iterrows():
-        by_class[int(row['_label_id'])].append(row['_path'])
+    for lid, path in zip(df['_label_id'], df['_path']):
+        by_class[int(lid)].append(path)
 
     rng = np.random.RandomState(seed)
     sampled_files, sampled_labels = [], []
+    shortfall = {}
+    chosen_set = set()
+    remaining_by_class = {}
+    base_n = min(samples_per_class.values()) if isinstance(samples_per_class, dict) else samples_per_class
     print(f"  FMA ジャンル別利用可能数:")
     for label_id in range(len(label_name_to_id)):
         candidates = by_class[label_id]
-        n = min(samples_per_class, len(candidates))
+        spc = samples_per_class[label_id] if isinstance(samples_per_class, dict) else samples_per_class
+        n = min(spc, len(candidates))
         name = id_to_name.get(label_id, f'id{label_id}')
-        print(f"    {name:<12} {len(candidates):>6} 件 → {n} 件サンプリング")
+        mult_str = f" (x{spc/max(1,base_n):.1f})" if spc != base_n else ""
+        deficit = spc - n
+        deficit_str = f"  [不足: {deficit}]" if deficit > 0 else ""
+        print(f"    {name:<12} {len(candidates):>6} 件 → {n} 件サンプリング{mult_str}{deficit_str}")
+        if deficit > 0:
+            shortfall[label_id] = deficit
         if n > 0:
-            chosen = rng.choice(candidates, n, replace=False)
+            chosen = list(rng.choice(candidates, n, replace=False))
             sampled_files.extend(chosen)
             sampled_labels.extend([label_id] * n)
+            chosen_set.update(chosen)
+        remaining_by_class[label_id] = [c for c in candidates if c not in chosen_set]
 
-    return sampled_files, np.array(sampled_labels, dtype=np.int64)
+    return sampled_files, np.array(sampled_labels, dtype=np.int64), shortfall, remaining_by_class
 
 
 # ==============================================================================
@@ -718,16 +793,26 @@ if __name__ == '__main__':
 
     # MagnaTagATune 外部データの追加
     magna_labels = None
+    ext_shortfall = {}  # 前段データセットの不足分を後段に引き継ぐ
+    ext_remaining_pools = []  # バックフィル用: 各データセットの未使用候補
     if getattr(config, 'USE_MAGNA_DATA', False):
         magna_dir = getattr(config, 'MAGNA_DATASET_DIR', 'data/TheMagnaTagATuneDataset')
         magna_ann = getattr(config, 'MAGNA_ANNOTATIONS_FILE',
                             'data/TheMagnaTagATuneDataset/annotations_final.csv')
         magna_n = getattr(config, 'MAGNA_SAMPLES_PER_CLASS', 50)
-        print(f"\n=== MagnaTagATune 外部データ読み込み ({magna_n} 件/クラス) ===")
-        magna_files, magna_labels = load_magna_data(
-            label_master, magna_dir, magna_ann, magna_n, seed=SEED)
+        magna_spc = compute_oversample_per_class(magna_n, label_master)
+        print(f"\n=== MagnaTagATune 外部データ読み込み (base {magna_n} 件/クラス) ===")
+        magna_files, magna_labels, magna_shortfall, magna_remaining = load_magna_data(
+            label_master, magna_dir, magna_ann, magna_spc, seed=SEED)
+        ext_remaining_pools.append(("MagnaTagATune", magna_remaining))
         train_files = train_files + magna_files
         print(f"  追加: {len(magna_files)} 件 → 学習ファイル合計: {len(train_files)} 件")
+        if magna_shortfall:
+            id_to_name_tmp = label_master.set_index('label_id')['label_name'].to_dict()
+            print(f"  不足分 (後段に引き継ぎ): "
+                  + ", ".join(f"{id_to_name_tmp[k]}={v}" for k, v in sorted(magna_shortfall.items())))
+        for k, v in magna_shortfall.items():
+            ext_shortfall[k] = ext_shortfall.get(k, 0) + v
 
         id_to_name = label_master.set_index('label_id')['label_name'].to_dict()
         magna_profile = pd.DataFrame({
@@ -769,11 +854,23 @@ if __name__ == '__main__':
         fma_subs = getattr(config, 'FMA_SUBSETS', ['small', 'medium'])
         fma_dur = getattr(config, 'FMA_MIN_DURATION', 30)
         fma_n = getattr(config, 'FMA_SAMPLES_PER_CLASS', 100)
-        print(f"\n=== FMA 外部データ読み込み ({fma_n} 件/クラス) ===")
-        fma_files, fma_labels = load_fma_data(
-            label_master, fma_base, fma_csv, fma_subs, fma_dur, fma_n, seed=SEED)
+        fma_spc = compute_oversample_per_class(fma_n, label_master)
+        # 前段の不足分を上乗せ
+        if ext_shortfall:
+            id_to_name_tmp = label_master.set_index('label_id')['label_name'].to_dict()
+            print(f"\n  前段データセットからの不足補填:")
+            for lid, deficit in sorted(ext_shortfall.items()):
+                old = fma_spc.get(lid, fma_n)
+                fma_spc[lid] = old + deficit
+                print(f"    {id_to_name_tmp[lid]:<12} {old} + {deficit} (補填) = {fma_spc[lid]}")
+        print(f"\n=== FMA 外部データ読み込み (base {fma_n} 件/クラス) ===")
+        fma_files, fma_labels, fma_shortfall, fma_remaining = load_fma_data(
+            label_master, fma_base, fma_csv, fma_subs, fma_dur, fma_spc, seed=SEED)
+        ext_remaining_pools.append(("FMA", fma_remaining))
         train_files = train_files + fma_files
         print(f"  追加: {len(fma_files)} 件 → 学習ファイル合計: {len(train_files)} 件")
+        # FMA が最終段: shortfall をバックフィル対象として上書き
+        ext_shortfall = dict(fma_shortfall)
 
         id_to_name = label_master.set_index('label_id')['label_name'].to_dict()
         fma_profile = pd.DataFrame({
@@ -784,6 +881,74 @@ if __name__ == '__main__':
         fma_csv_path = 'data/fma_sampled.csv'
         fma_profile.to_csv(fma_csv_path, index=False)
         print(f"  サンプリング結果を保存: {fma_csv_path} ({len(fma_profile)} 件)")
+
+    # バックフィル: 全外部データセット読み込み後に残余プールから不足分を補填
+    ext_magna_counts = None
+    ext_fma_counts = None
+    ext_backfill_counts = None
+    num_classes_ext = getattr(config, 'NUM_CLASSES', 10)
+
+    if ext_shortfall and ext_remaining_pools:
+        id_to_name_bf = label_master.set_index('label_id')['label_name'].to_dict()
+        rng_bf = np.random.RandomState(SEED + 999)
+        backfill_files, backfill_labels = [], []
+        remaining_shortfall = dict(ext_shortfall)
+        print(f"\n=== バックフィル (残余プールから不足補填) ===")
+        for lid in sorted(remaining_shortfall.keys()):
+            need = remaining_shortfall[lid]
+            if need <= 0:
+                continue
+            for ds_name, pool in ext_remaining_pools:
+                avail = pool.get(lid, [])
+                if not avail or need <= 0:
+                    continue
+                take = min(need, len(avail))
+                chosen = list(rng_bf.choice(avail, take, replace=False))
+                backfill_files.extend(chosen)
+                backfill_labels.extend([lid] * take)
+                pool[lid] = [c for c in avail if c not in set(chosen)]
+                print(f"  {id_to_name_bf[lid]:<12} +{take} from {ds_name} (残 {len(pool[lid])})")
+                need -= take
+            remaining_shortfall[lid] = need
+
+        if backfill_files:
+            ext_magna_counts = np.bincount(magna_labels, minlength=num_classes_ext) if magna_labels is not None else np.zeros(num_classes_ext)
+            ext_fma_counts = np.bincount(fma_labels, minlength=num_classes_ext) if fma_labels is not None else np.zeros(num_classes_ext)
+            ext_backfill_counts = np.bincount(np.array(backfill_labels, dtype=np.int64), minlength=num_classes_ext)
+
+            train_files = train_files + backfill_files
+            backfill_labels_arr = np.array(backfill_labels, dtype=np.int64)
+            if fma_labels is not None:
+                fma_labels = np.concatenate([fma_labels, backfill_labels_arr])
+            elif magna_labels is not None:
+                magna_labels = np.concatenate([magna_labels, backfill_labels_arr])
+            print(f"  バックフィル合計: {len(backfill_files)} 件追加 → 学習ファイル合計: {len(train_files)} 件")
+
+        still_short = {k: v for k, v in remaining_shortfall.items() if v > 0}
+        if still_short:
+            print(f"  ⚠ 補填不可: "
+                  + ", ".join(f"{id_to_name_bf[k]}={v}" for k, v in sorted(still_short.items())))
+
+    # 外部データセット ジャンル別サンプリング数サマリ（バックフィル後）
+    if magna_labels is not None or fma_labels is not None:
+        id_to_name_sum = label_master.set_index('label_id')['label_name'].to_dict()
+        if ext_magna_counts is None:
+            ext_magna_counts = np.bincount(magna_labels, minlength=num_classes_ext) if magna_labels is not None else np.zeros(num_classes_ext)
+        if ext_fma_counts is None:
+            ext_fma_counts = np.bincount(fma_labels, minlength=num_classes_ext) if fma_labels is not None else np.zeros(num_classes_ext)
+        if ext_backfill_counts is None:
+            ext_backfill_counts = np.zeros(num_classes_ext)
+
+        print(f"\n=== 外部データセット ジャンル別サンプリング数（最終） ===")
+        print(f"  {'Genre':<12} {'Magna':>8} {'FMA':>8} {'Backfill':>10} {'Total_ext':>10}")
+        print("  " + "-" * 52)
+        for lid in range(num_classes_ext):
+            name = id_to_name_sum.get(lid, f"c{lid}")
+            m, f, b = int(ext_magna_counts[lid]), int(ext_fma_counts[lid]), int(ext_backfill_counts[lid])
+            tot = m + f + b
+            print(f"  {name:<12} {m:>8} {f:>8} {b:>10} {tot:>10}")
+        print("  " + "-" * 52)
+        print(f"  {'Total':<12} {int(ext_magna_counts.sum()):>8} {int(ext_fma_counts.sum()):>8} {int(ext_backfill_counts.sum()):>10} {int(ext_magna_counts.sum() + ext_fma_counts.sum() + ext_backfill_counts.sum()):>10}")
 
     # オーギュメンテーション設定プロファイルを CSV に出力
     aug_profile = {
@@ -917,6 +1082,8 @@ if __name__ == '__main__':
         y_tmp = np.concatenate([y_tmp, magna_labels])
     if gtzan_labels is not None and len(gtzan_labels) > 0:
         y_tmp = np.concatenate([y_tmp, gtzan_labels])
+    if fma_labels is not None and len(fma_labels) > 0:
+        y_tmp = np.concatenate([y_tmp, fma_labels])
 
     print(f"\nTrain by label (values <= {VOCAL_INTEGRAL_THRESHOLD}):")
     for lid in sorted(id_to_name.keys()):
@@ -1014,18 +1181,23 @@ def compute_genre_drop_prob(y, vocal_integrals, label_master):
     print(f"\n  ボーカル抜きオーギュメンテーション内訳 (閾値={th}, 目標割合={target_ratio:.0%})")
     print(f"  {'ジャンル':<12} {'低(≤th)':>8} {'高(>th)':>8} {'適用確率':>10} {'現在の割合':>10} {'期待割合':>10}")
     print("  " + "-" * 58)
+    by_genre_override = getattr(config, 'VOCAL_DROP_BY_GENRE', None)
     for label_id in range(config.NUM_CLASSES):
         vals = by_label.get(label_id, [])
         L = sum(1 for v in vals if v <= th)
         H = len(vals) - L
         n = L + H
+        name = id_to_name.get(label_id, f"id{label_id}")
         p = (target_ratio * (H - L) / H) if H > 0 else 0.0
-        genre_drop_prob[label_id] = float(np.clip(p, 0.0, 1.0))
+        if by_genre_override is not None and name in by_genre_override:
+            genre_drop_prob[label_id] = float(np.clip(p, 0.0, 1.0)) if by_genre_override[name] else 0.0
+        else:
+            genre_drop_prob[label_id] = float(np.clip(p, 0.0, 1.0))
         curr_ratio = L / n if n else 0
         exp_low = L + genre_drop_prob[label_id] * H
         exp_ratio = exp_low / n if n else 0
-        name = id_to_name.get(label_id, f"id{label_id}")
-        print(f"  {name:<12} {L:>8} {H:>8} {genre_drop_prob[label_id]:>10.2%} {curr_ratio:>10.1%} {exp_ratio:>10.1%}")
+        off_str = " (OFF)" if (by_genre_override and name in by_genre_override and not by_genre_override[name]) else ""
+        print(f"  {name:<12} {L:>8} {H:>8} {genre_drop_prob[label_id]:>10.2%} {curr_ratio:>10.1%} {exp_ratio:>10.1%}{off_str}")
     print("  " + "-" * 58)
 
     return genre_drop_prob
@@ -1183,6 +1355,99 @@ def _print_per_genre_valid(all_labels, all_preds, id_to_name, num_classes=NUM_CL
         print(f"    {name:<12} {correct:>3}/{n:<3} = {acc_c:>5.1f}%")
 
 
+def log_fold_genre_errors(fold, best_epoch, best_valid_acc,
+                          all_labels, all_preds, valid_files_fold,
+                          id_to_name, log_path="cv_genre_errors.log",
+                          num_classes=NUM_CLASSES):
+    """各 Fold のベストモデルでジャンル別正解率・混同行列・誤分類ファイル一覧をログ出力。
+    Returns: ジャンル名 -> 正解率(%) の dict（サマリ用）
+    """
+    from sklearn.metrics import confusion_matrix
+    import datetime
+
+    genre_acc = {}
+    mode = "a" if fold > 0 else "w"
+    with open(log_path, mode, encoding="utf-8") as f:
+        if fold == 0:
+            f.write(f"# CV Genre Error Analysis  {datetime.datetime.now():%Y-%m-%d %H:%M}\n")
+            f.write("=" * 80 + "\n\n")
+
+        f.write(f"{'='*80}\n")
+        f.write(f"  Fold {fold + 1}  best_epoch={best_epoch}  Valid Acc={best_valid_acc:.4f}\n")
+        f.write(f"{'='*80}\n\n")
+
+        # ジャンル別正解率
+        f.write("  Genre Accuracy:\n")
+        for c in range(num_classes):
+            mask = all_labels == c
+            n = int(mask.sum())
+            if n == 0:
+                continue
+            correct = int(((all_preds == all_labels) & mask).sum())
+            acc_c = 100.0 * correct / n
+            name = id_to_name.get(c, f"class_{c}")
+            f.write(f"    {name:<12} {correct:>3}/{n:<3} = {acc_c:>5.1f}%\n")
+            genre_acc[name] = acc_c
+
+        # 混同行列
+        cm = confusion_matrix(all_labels, all_preds, labels=list(range(num_classes)))
+        names = [id_to_name.get(c, f"c{c}") for c in range(num_classes)]
+        f.write(f"\n  Confusion Matrix (row=true, col=pred):\n")
+        header = "              " + "".join(f"{n[:5]:>6}" for n in names)
+        f.write(header + "\n")
+        for i, row in enumerate(cm):
+            line = f"    {names[i]:<10}" + "".join(f"{v:>6}" for v in row)
+            f.write(line + "\n")
+
+        # 誤分類ファイル一覧
+        f.write(f"\n  Misclassified files ({int((all_preds != all_labels).sum())} total):\n")
+        misclass_by_genre = {c: [] for c in range(num_classes)}
+        for idx in range(len(all_labels)):
+            if all_preds[idx] != all_labels[idx]:
+                true_c = int(all_labels[idx])
+                pred_c = int(all_preds[idx])
+                fname = os.path.basename(valid_files_fold[idx]) if idx < len(valid_files_fold) else f"idx_{idx}"
+                misclass_by_genre[true_c].append((fname, id_to_name.get(pred_c, f"c{pred_c}")))
+
+        for c in range(num_classes):
+            items = misclass_by_genre[c]
+            if not items:
+                continue
+            name = id_to_name.get(c, f"class_{c}")
+            f.write(f"\n    [{name}] ({len(items)} errors):\n")
+            for fname, pred_name in sorted(items):
+                f.write(f"      {fname}  → predicted: {pred_name}\n")
+
+        f.write("\n\n")
+
+    return genre_acc
+
+
+def append_cv_summary_to_log(fold_scores, genre_accs_per_fold, id_to_name,
+                             log_path="cv_genre_errors.log"):
+    """ログファイル末尾に CV サマリと Genre Accuracy 平均を追記"""
+    if not fold_scores or not genre_accs_per_fold:
+        return
+    genre_names = [id_to_name.get(c, f"class_{c}") for c in sorted(id_to_name.keys())]
+    with open(log_path, "a", encoding="utf-8") as f:
+        f.write("=" * 80 + "\n")
+        f.write("  CV Summary\n")
+        f.write("=" * 80 + "\n\n")
+        for i, score in enumerate(fold_scores):
+            f.write(f"  Fold {i + 1}: {score:.4f}\n")
+        f.write(f"  Mean: {np.mean(fold_scores):.4f} +/- {np.std(fold_scores):.4f}\n\n")
+
+        f.write("  Genre Accuracy (mean +/- std across folds):\n")
+        for name in genre_names:
+            accs = [g.get(name) for g in genre_accs_per_fold if g.get(name) is not None]
+            if not accs:
+                continue
+            mean_acc = np.mean(accs)
+            std_acc = np.std(accs) if len(accs) > 1 else 0.0
+            f.write(f"    {name:<12} {mean_acc:>5.1f}% +/- {std_acc:>4.1f}%\n")
+        f.write("\n")
+
+
 def run_training_loop(model, train_loader, valid_loader, criterion, optimizer,
                       scheduler, fold=0, start_epoch=1, best_valid_acc=0,
                       best_epoch=0, patience_counter=0, id_to_name=None):
@@ -1276,20 +1541,20 @@ def run_training_loop(model, train_loader, valid_loader, criterion, optimizer,
     return best_valid_acc, best_epoch
 
 # ==============================================================================
-# モデル定義: EfficientNet B3（モジュールレベルで定義、ワーカーから利用）
+# モデル定義: EfficientNet B7（モジュールレベルで定義、ワーカーから利用）
 # ==============================================================================
 def build_model(num_classes=NUM_CLASSES):
-    """事前学習済み EfficientNet B3 を Fine-tuning 用に構築
+    """事前学習済み EfficientNet B7 を Fine-tuning 用に構築
 
     3チャンネル入力:
         ch0 = 原音メルスペクトログラム
         ch1 = 伴奏メルスペクトログラム
         ch2 = ボーカルメルスペクトログラム
     """
-    model = models.efficientnet_b3(weights=models.EfficientNet_B3_Weights.IMAGENET1K_V1)
+    model = models.efficientnet_b7(weights=models.EfficientNet_B7_Weights.IMAGENET1K_V1)
 
-    # 前半の層をフリーズ（過学習防止）
-    for param in model.features[:6].parameters():
+    # 前半の層をフリーズ
+    for param in model.features[:4].parameters():
         param.requires_grad = False
 
     # 分類ヘッドを置き換え
@@ -1464,9 +1729,15 @@ signal.signal(signal.SIGTERM, signal_handler)
 # K-Fold 交差検証 + 全データ再学習（__main__ 内で実行）
 # ==============================================================================
 if __name__ == '__main__':
-    indices = np.arange(len(X_all))
     fold_scores = []
     FINAL_FOLD = max(N_FOLDS, 1)  # fold 番号: CV 時は N_FOLDS、CV なしは 1
+
+    # 元データと外部データの境界インデックス
+    ext_indices = np.arange(n_original_train, len(X_all))
+    orig_indices = np.arange(n_original_train)
+
+    n_ext = len(ext_indices)
+    print(f"\nCV split: original={n_original_train}, external={n_ext} (学習補助)")
 
     # ==================================================================
     # K-Fold 交差検証（N_FOLDS >= 2 のとき実行）
@@ -1474,15 +1745,22 @@ if __name__ == '__main__':
     if N_FOLDS >= 2:
         skf = StratifiedKFold(n_splits=N_FOLDS, shuffle=True, random_state=SEED)
 
-        print(f"\n=== {N_FOLDS}-Fold 交差検証 ===")
+        print(f"\n=== {N_FOLDS}-Fold 交差検証 (元データのみで分割, 外部データは学習に全量追加) ===")
 
-        for fold, (train_indices, valid_indices) in enumerate(skf.split(indices, y_all)):
+        y_orig = y_all[:n_original_train]
+        genre_accs_per_fold = []
+        for fold, (orig_train_idx, orig_valid_idx) in enumerate(skf.split(orig_indices, y_orig)):
             if interrupted:
                 break
 
             print(f"\n{'='*60}")
             print(f"  Fold {fold + 1}/{N_FOLDS}")
             print(f"{'='*60}")
+
+            # valid = 元データの valid split のみ
+            valid_indices = orig_valid_idx
+            # train = 元データの train split + 外部データ全量
+            train_indices = np.concatenate([orig_train_idx, ext_indices])
 
             X_train = X_all[train_indices]
             X_valid = X_all[valid_indices]
@@ -1491,7 +1769,8 @@ if __name__ == '__main__':
             train_files_fold = [train_files[i] for i in train_indices]
             valid_files_fold = [train_files[i] for i in valid_indices]
 
-            print(f"  Train: {len(X_train)}, Valid: {len(X_valid)}")
+            print(f"  Train: {len(X_train)} (original: {len(orig_train_idx)}, external: {n_ext})")
+            print(f"  Valid: {len(X_valid)} (original only)")
 
             # ボーカル抜き確率（Fold の学習分割から算出）
             vi_fold = None
@@ -1551,6 +1830,23 @@ if __name__ == '__main__':
             fold_scores.append(best_valid_acc)
             print(f"\n  Fold {fold + 1} best: epoch {best_epoch}, Valid Acc: {best_valid_acc:.4f}")
 
+            # ベストモデルで再評価し、ジャンル別エラーログを出力
+            best_model_path = BEST_MODEL_FILE.format(fold)
+            if os.path.isfile(best_model_path):
+                eval_model = build_model().to(DEVICE)
+                eval_model.load_state_dict(torch.load(best_model_path, map_location=DEVICE, weights_only=True))
+                _, _, fold_preds, fold_labels = evaluate(
+                    eval_model, valid_loader, criterion, return_predictions=True)
+                genre_acc = log_fold_genre_errors(
+                    fold, best_epoch, best_valid_acc,
+                    fold_labels, fold_preds, valid_files_fold,
+                    id_to_name)
+                genre_accs_per_fold.append(genre_acc)
+                print(f"  Genre error log written to cv_genre_errors.log")
+                del eval_model
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
             del model, optimizer, scheduler, train_loader, valid_loader
             del train_dataset, valid_dataset
             if torch.cuda.is_available():
@@ -1565,6 +1861,9 @@ if __name__ == '__main__':
                 print(f"  Fold {i + 1}: {score:.4f}")
             print(f"  Mean: {np.mean(fold_scores):.4f} +/- {np.std(fold_scores):.4f}")
             print(f"{'='*60}")
+            id_to_name_cv = label_master.set_index('label_id')['label_name'].to_dict()
+            append_cv_summary_to_log(fold_scores, genre_accs_per_fold, id_to_name_cv)
+            print(f"  CV summary appended to cv_genre_errors.log")
 
         # CV 後の待機（Ctrl+C で再学習をスキップ可能）
         if not interrupted and fold_scores:
@@ -1578,30 +1877,21 @@ if __name__ == '__main__':
                 print("\n再学習をスキップします。")
 
     # ==================================================================
-    # 全データで最終モデルを学習
+    # 全データで最終モデルを学習（アンサンブル対応）
     # ==================================================================
     if not interrupted:
+        n_ensemble = len(ENSEMBLE_SEEDS)
         print(f"\n{'='*60}")
-        print(f"  Final training on ALL data")
+        print(f"  Final training on ALL data (ensemble: {n_ensemble} seed(s))")
+        print(f"  Seeds: {ENSEMBLE_SEEDS}")
         print(f"{'='*60}")
 
-        # ボーカル抜き確率（全データから算出）
+        # ボーカル抜き確率（全データから算出、全シード共通）
         gdp_full = None
         if vocal_integrals_all is not None:
             gdp_full = compute_genre_drop_prob(y_all, vocal_integrals_all, label_master)
 
-        full_dataset = MelSpectrogramDataset(
-            X_all, file_list=train_files, y=y_all,
-            augment=True, max_frames=max_frames_train,
-            vocal_integrals=vocal_integrals_all, genre_drop_prob=gdp_full,
-        )
-        full_loader = DataLoader(
-            full_dataset, batch_size=BATCH_SIZE, shuffle=True,
-            num_workers=12, persistent_workers=True,
-            pin_memory=torch.cuda.is_available(),
-        )
-
-        # CV 実施済みなら平均ベストエポック数で学習、そうでなければ EPOCHS まで
+        # CV 実施済みなら平均ベストエポック数で学習、そうでなければ EPOCHS（または EPOCHS_TO_FORCE_FINISH）まで
         if fold_scores:
             cv_best_epochs = []
             for fi in range(N_FOLDS):
@@ -1611,53 +1901,74 @@ if __name__ == '__main__':
                     cv_best_epochs.append(ckpt.get('best_epoch', EPOCHS))
             final_epochs = max(1, int(np.mean(cv_best_epochs))) if cv_best_epochs else EPOCHS
         else:
-            final_epochs = EPOCHS
+            if EPOCHS_TO_FORCE_FINISH is not None and EPOCHS_TO_FORCE_FINISH > 0:
+                final_epochs = min(EPOCHS, EPOCHS_TO_FORCE_FINISH)
+            else:
+                final_epochs = EPOCHS
 
         saved_epochs = EPOCHS
         EPOCHS = final_epochs
-        print(f"  Epochs: {EPOCHS}" + (f" (CV average best epoch)" if fold_scores else ""))
+        epoch_note = ""
+        if fold_scores:
+            epoch_note = " (CV average best epoch)"
+        elif EPOCHS_TO_FORCE_FINISH is not None and EPOCHS_TO_FORCE_FINISH > 0:
+            epoch_note = f" (EPOCHS_TO_FORCE_FINISH={EPOCHS_TO_FORCE_FINISH})"
+        print(f"  Epochs: {EPOCHS}" + epoch_note)
 
-        model = build_model().to(DEVICE)
-        criterion = nn.CrossEntropyLoss()
-        optimizer = optim.AdamW(
-            filter(lambda p: p.requires_grad, model.parameters()),
-            lr=LR, weight_decay=WEIGHT_DECAY,
-        )
-        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=saved_epochs, eta_min=1e-6)
+        for seed_idx, seed in enumerate(ENSEMBLE_SEEDS):
+            if interrupted:
+                break
 
-        if RESUME_FROM_CHECKPOINT:
-            start_epoch, _, _, _ = load_checkpoint(
-                model, optimizer, scheduler, fold=FINAL_FOLD,
-                load_optimizer=LOAD_OPTIMIZER_STATE,
-                load_scheduler=LOAD_SCHEDULER_STATE,
+            fold_tag = f"seed{seed}"
+            print(f"\n{'='*60}")
+            print(f"  Ensemble model {seed_idx + 1}/{n_ensemble}  (seed={seed})")
+            print(f"{'='*60}")
+
+            set_seed(seed)
+
+            full_dataset = MelSpectrogramDataset(
+                X_all, file_list=train_files, y=y_all,
+                augment=True, max_frames=max_frames_train,
+                vocal_integrals=vocal_integrals_all, genre_drop_prob=gdp_full,
             )
-        else:
-            start_epoch = 1
+            full_loader = DataLoader(
+                full_dataset, batch_size=BATCH_SIZE, shuffle=True,
+                num_workers=12, persistent_workers=True,
+                pin_memory=torch.cuda.is_available(),
+            )
 
-        run_training_loop(
-            model, full_loader, None, criterion, optimizer, scheduler,
-            fold=FINAL_FOLD, start_epoch=start_epoch,
-        )
+            model = build_model().to(DEVICE)
+            criterion = nn.CrossEntropyLoss()
+            optimizer = optim.AdamW(
+                filter(lambda p: p.requires_grad, model.parameters()),
+                lr=LR, weight_decay=WEIGHT_DECAY,
+            )
+            scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=saved_epochs, eta_min=1e-6)
+
+            if RESUME_FROM_CHECKPOINT:
+                start_epoch, _, _, _ = load_checkpoint(
+                    model, optimizer, scheduler, fold=fold_tag,
+                    load_optimizer=LOAD_OPTIMIZER_STATE,
+                    load_scheduler=LOAD_SCHEDULER_STATE,
+                )
+            else:
+                start_epoch = 1
+
+            run_training_loop(
+                model, full_loader, None, criterion, optimizer, scheduler,
+                fold=fold_tag, start_epoch=start_epoch,
+            )
+
+            del model, optimizer, scheduler, full_loader, full_dataset
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
         EPOCHS = saved_epochs
 
-        del full_loader, full_dataset
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
     # ==================================================================
-    # テストデータの推論・提出ファイル作成
+    # テストデータの推論・提出ファイル作成（アンサンブル対応）
     # ==================================================================
-    print("\n=== テストデータ推論 ===")
-
-    final_model_path = BEST_MODEL_FILE.format(FINAL_FOLD)
-    if os.path.exists(final_model_path):
-        model = build_model().to(DEVICE)
-        model.load_state_dict(torch.load(final_model_path, map_location=DEVICE))
-        print(f"最終モデルを読み込み: {final_model_path}")
-    else:
-        print(f"エラー: {final_model_path} が見つかりません。")
-        sys.exit(1)
+    print(f"\n=== テストデータ推論 (ensemble: {len(ENSEMBLE_SEEDS)} model(s)) ===")
 
     # テスト用 Dataset は全学習データの正規化パラメータを使用
     norm_dataset = MelSpectrogramDataset(
@@ -1677,18 +1988,44 @@ if __name__ == '__main__':
         pin_memory=torch.cuda.is_available(),
     )
 
-    model.eval()
-    all_preds = []
-    with torch.no_grad():
-        for X_batch in test_loader:
-            X_batch = X_batch.to(DEVICE, non_blocking=True)
-            outputs = model(X_batch)
-            preds = outputs.argmax(dim=1).cpu().numpy()
-            all_preds.extend(preds)
-            del outputs, X_batch
+    n_test = len(test_files)
+    ensemble_probs = np.zeros((n_test, NUM_CLASSES), dtype=np.float64)
+    loaded_count = 0
 
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+    for seed in ENSEMBLE_SEEDS:
+        model_path = BEST_MODEL_FILE.format(f"seed{seed}")
+        if not os.path.exists(model_path):
+            print(f"  [SKIP] {model_path} が見つかりません")
+            continue
+
+        model = build_model().to(DEVICE)
+        model.load_state_dict(torch.load(model_path, map_location=DEVICE))
+        model.eval()
+        print(f"  モデル読み込み: {model_path}")
+
+        batch_probs = []
+        with torch.no_grad():
+            for X_batch in test_loader:
+                X_batch = X_batch.to(DEVICE, non_blocking=True)
+                outputs = model(X_batch)
+                probs = torch.softmax(outputs, dim=1).cpu().numpy()
+                batch_probs.append(probs)
+                del outputs, X_batch
+
+        ensemble_probs += np.concatenate(batch_probs, axis=0)
+        loaded_count += 1
+
+        del model
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    if loaded_count == 0:
+        print("エラー: アンサンブル用モデルが1つも見つかりません。")
+        sys.exit(1)
+
+    ensemble_probs /= loaded_count
+    all_preds = ensemble_probs.argmax(axis=1)
+    print(f"  アンサンブル完了: {loaded_count} モデルの softmax 平均 → argmax")
 
     test_file_names = [os.path.basename(f) for f in test_files]
     submit_df = pd.DataFrame({
